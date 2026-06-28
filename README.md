@@ -1,6 +1,6 @@
 # recursive-self-improvement
 
-**A Recursive Self-Improving AI that fine-tunes its own weights from failures — meta agent, target agent, LoRA, repeat.**
+**A Recursive Self-Improving AI that rewrites its own agent code from failures and fine-tunes its own weights — meta agent, feedback agent, target agent, LoRA, repeat.**
 
 Built for the [AIEWF Hackathon 2026](https://cerebralvalley.ai/e/aiewf-hackathon-2026/details).
 
@@ -10,15 +10,18 @@ Built for the [AIEWF Hackathon 2026](https://cerebralvalley.ai/e/aiewf-hackathon
 
 ```mermaid
 flowchart TD
-    A([Start Generation N]) --> B
+    A([Start Generation 0]) --> B
 
-    B["① META AGENT\nKimi K2.6\nWrites target_agent.py"]
+    B["① META AGENT — gen 0 only\nKimi K2.6\nBootstraps target_agent.py from task description"]
     B --> C
 
-    C["② TARGET AGENT\nKimi K2.5\nRuns target_agent.py and generates sol.py"]
+    B2["① FEEDBACK AGENT — gen 1+\nKimi K2.6\nRewrites target_agent.py using:\n• previous script\n• sol.py produced\n• eval error\n• context.md history"]
+    B2 --> C
+
+    C["② TARGET AGENT\nKimi K2.5\nRuns target_agent.py → generates sol.py"]
     C --> D
 
-    D["③ TENSARA EVAL\nH100 GPU\nRuns sol.py and does correctness check and benchmark"]
+    D["③ TENSARA EVAL\nH100 GPU\nRuns sol.py: correctness check + benchmark"]
     D --> E{Accepted?}
 
     E -- "ACCEPTED\nGFLOPS + latency" --> F2
@@ -33,10 +36,11 @@ flowchart TD
     F2["⑤ SKIP TRAINING\nno failure to learn from"]
     F2 --> H
 
-    H([Start Generation N+1\nwith improved weights])
-    H --> B
+    H([Start Generation N+1])
+    H --> B2
 
     style B fill:#dbeafe,stroke:#3b82f6
+    style B2 fill:#bfdbfe,stroke:#2563eb
     style C fill:#fef3c7,stroke:#f59e0b
     style D fill:#dcfce7,stroke:#22c55e
     style F1 fill:#fee2e2,stroke:#ef4444
@@ -44,34 +48,37 @@ flowchart TD
     style F2 fill:#f0fdf4,stroke:#86efac
 ```
 
-Each generation, the loop runs five steps:
+Each generation runs five steps. The key innovation is the **feedback agent** (gen 1+): instead of writing `target_agent.py` from scratch with no memory, it reads the previous script, the kernel it produced, the specific error, and the full generation history — then surgically rewrites it to fix the exact failure pattern seen.
 
-1. **Meta agent** (Kimi K2.6) writes a `target_agent.py` script — a Python program that instructs the target LLM how to approach the GPU kernel task
-2. **Target agent** (Nemotron Ultra 550B) executes that script, calls the LLM, and writes a Triton kernel to `sol.py`
-3. **Tensara evaluator** submits `sol.py` to a remote H100 — first checks correctness, then benchmarks for GFLOPS and latency
-4. **Curator** (Gemma 4 31B) reads the failure log and `sol.py` and produces a structured `(prompt, completion)` training pair → appended to `train.jsonl`
-5. **LoRA trainer** (`llama-finetune`) fine-tunes Gemma4-1B on `train.jsonl` on CPU — hyperparameters (rank, LR, epochs) self-adjust based on ΔPerformance
+1. **Meta agent** (Kimi K2.6, gen 0 only) writes the initial `target_agent.py` — a Python script that instructs the target LLM how to write a Triton kernel
+2. **Feedback agent** (Kimi K2.6, gen 1+) receives `previous target_agent.py + sol.py + eval result + context.md` and rewrites `target_agent.py` to fix the specific error. Accumulates `context.md` history so it doesn't repeat failed approaches.
+3. **Target agent** (Kimi K2.5) executes `target_agent.py`, calls the LLM, and writes a Triton kernel to `sol.py`
+4. **Tensara evaluator** submits `sol.py` to a remote H100 — checks correctness, then benchmarks for GFLOPS and latency
+5. **Curator** (Gemma 4 31B) reads the failure log and `sol.py` and produces a structured `(prompt, completion)` training pair → appended to `train.jsonl`
+6. **LoRA trainer** (`llama-finetune`) fine-tunes Gemma4-1B on `train.jsonl` on CPU — hyperparameters (rank, LR, epochs) self-adjust based on ΔPerformance
 
 ```
-Gen 0:  Kimi writes strategy → Nemotron writes kernel → WRONG_ANSWER → Gemma curates → train Gemma4-1B
-Gen 1:  improved strategy    → better kernel          → ACCEPTED     → 41 GFLOPS
-Gen 2:  ...                                                           → 56 GFLOPS (+36%)
+Gen 0:  Meta writes strategy  → Kimi K2.5 writes kernel → COMPILE_ERROR → curate → train Gemma4-1B
+Gen 1:  Feedback sees error   → fixes system prompt      → WRONG_ANSWER  → curate → train
+Gen 2:  Feedback sees pattern → adds post-processing     → ACCEPTED      → 41 GFLOPS
+Gen 3:  ...                                                               → 56 GFLOPS (+36%)
 ```
 
 ---
 
 ## Execution flow in detail
 
-### Step 1 — Meta agent (`rsi/loop.py` → `rsi/agent.py`)
+### Step 1 — Meta agent (gen 0) and Feedback agent (gen 1+)
 
-`run_meta_agent()` calls **Kimi K2.6** on DO Model Studio with a system prompt that instructs it to write a Python script. The script it produces (`target_agent.py`) will:
-- Read the task description from the `TASK_MD` env var
-- Call the target LLM via the OpenAI-compatible API (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `MODEL_NAME`)
-- Use `max_tokens=8000` — enough for the model to think and then produce full kernel code
-- Fall back to `reasoning_content` if `content` is `None` (handles thinking models like Nemotron)
-- Write the kernel to `sol.py` in `OUTPUT_DIR`
+**Gen 0 — `run_meta_agent()`**: Calls **Kimi K2.6** with the task description and a system prompt containing Triton kernel rules. Produces the first `target_agent.py`.
 
-Kimi's output is stripped of markdown fences and saved as `gen-N/target_agent.py`.
+**Gen 1+ — `run_feedback_agent()`**: Calls **Kimi K2.6** with:
+- The previous gen's `target_agent.py` source
+- The `sol.py` it produced
+- The eval result (`COMPILE_ERROR`, `STATIC_CHECK_FAILED`, etc.)
+- `context.md` — one line per generation summarising what was tried and what failed
+
+The feedback agent writes `improvement.md`-style reasoning into its rewritten script, ensuring each gen addresses a specific failure rather than starting blind.
 
 ### Step 2 — Target agent (`rsi/loop.py` → subprocess)
 
@@ -81,11 +88,11 @@ Kimi's output is stripped of markdown fences and saved as `gen-N/target_agent.py
 |---|---|
 | `OPENAI_BASE_URL` | `https://inference.do-ai.run/v1/` |
 | `OPENAI_API_KEY` | `MODEL_ACCESS_KEY` |
-| `MODEL_NAME` | `nemotron-3-ultra-550b` |
+| `MODEL_NAME` | `kimi-k2.5` |
 | `TASK_MD` | path to `tasks/gpu_kernel_task/task.md` |
 | `OUTPUT_DIR` | path to `runs/run-NNN/gen-N/` |
 
-The target agent calls **Nemotron Ultra 550B** and writes `sol.py` to `OUTPUT_DIR`.
+The target agent calls **Kimi K2.5** and writes `sol.py` to `OUTPUT_DIR`. A `_clean_sol()` post-processor strips any reasoning prose Kimi prepends before the code.
 
 ### Step 3 — Tensara evaluation (`tasks/gpu_kernel_task/evaluate.py`)
 
@@ -97,7 +104,7 @@ The target agent calls **Nemotron Ultra 550B** and writes `sol.py` to `OUTPUT_DI
    - `.ravel()` calls (invalid in Triton)
    - `tl.cdiv()` with non-constexpr first arg
    - Missing `import torch`
-3. **Correctness check** — calls `TensaraClient.run_checker()` against the reference implementation on H100. If this fails, skips benchmarking and saves `results.json` with the failure.
+3. **Correctness check** — calls `TensaraClient.run_checker()` against the reference implementation on H100
 4. **Benchmark** — if correctness passes, calls `TensaraClient.run_benchmark()` and collects per-shape GFLOPS and latency via SSE streaming
 5. **Leaderboard comparison** — fetches the current leaderboard best and reports whether the solution beats it
 6. **Saves** `results.json` with status, accuracy, average latency (ms), average GFLOPS, and per-shape breakdown
@@ -106,11 +113,7 @@ Possible `status` values: `ACCEPTED`, `WRONG_ANSWER`, `COMPILE_ERROR`, `RUNTIME_
 
 ### Step 4 — Curation (`rsi/curate.py`)
 
-On any non-`ACCEPTED` status where `sol.py` exists, `curate_via_api()` calls **Gemma 4 31B** with:
-- The failed kernel code
-- The error message from `results.json`
-
-The curator returns a JSON object with `prompt` (what went wrong and how to fix it) and `completion` (the corrected kernel). This is appended as one line to `train.jsonl`.
+On any non-`ACCEPTED` status where `sol.py` exists, `curate_via_api()` calls **Gemma 4 31B** with the failed kernel code and the error message. The curator returns a JSON object with `prompt` (what went wrong and how to fix it) and `completion` (the corrected kernel). Appended as one line to `train.jsonl`.
 
 ### Step 5 — LoRA training (`rsi/train.py`)
 
@@ -135,11 +138,14 @@ After training, `merge_lora()` bakes the adapter into a new standalone GGUF (`ge
 
 ```
 providers/do.json               ← DO Model Studio endpoint + auth env var
-profiles/kimi26-do.json         ← meta agent   (Kimi K2.6)
-profiles/nemotron-do.json       ← target agent (Nemotron Ultra 550B)
-profiles/curator-do.json        ← curator      (Gemma 4 31B)
+profiles/kimi26-do.json         ← meta/feedback agent  (Kimi K2.6)
+profiles/nemotron-do.json       ← target agent         (Kimi K2.5)
+profiles/curator-do.json        ← curator              (Gemma 4 31B)
 
-rsi/loop.py                     ← main orchestrator (5-step RSI cycle)
+rsi/loop.py                     ← main orchestrator
+                                     run_meta_agent()     — gen 0 bootstrap
+                                     run_feedback_agent() — gen 1+ improvement loop
+                                     update_context()     — context.md history tracker
 rsi/agent.py                    ← OpenAI-compat LLM caller
 rsi/curate.py                   ← failure logs → train.jsonl
 rsi/train.py                    ← llama-finetune wrapper + hyperparameter tracker
@@ -147,9 +153,16 @@ rsi/train.py                    ← llama-finetune wrapper + hyperparameter trac
 tasks/gpu_kernel_task/
   task.md                       ← problem statement (matrix-vector multiply)
   evaluate.py                   ← Tensara submission + SSE result parser
-  tensara_client.py             ← lightweight Tensara API client (no dependencies)
+  tensara_client.py             ← lightweight Tensara API client
 
-setup/droplet_setup.sh          ← DO CPU droplet initialization + llama.cpp build
+runs/run-NNN/
+  context.md                    ← one-line-per-gen history for feedback agent
+  run.log                       ← full stdout+stderr log of the run
+  train.jsonl                   ← curator training pairs
+  gen-N/
+    target_agent.py             ← script written by meta/feedback agent
+    sol.py                      ← Triton kernel written by target agent
+    results.json                ← Tensara eval output
 ```
 
 ---
@@ -159,10 +172,9 @@ setup/droplet_setup.sh          ← DO CPU droplet initialization + llama.cpp bu
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/<you>/recursive-self-improvement
+git clone https://github.com/whatdhack/recursive-self-improvement
 cd recursive-self-improvement
-cp .env.example .env
-# fill in MODEL_ACCESS_KEY and TENSARA_API_KEY
+# export MODEL_ACCESS_KEY, TENSARA_API_KEY, TENSARA_USERID
 ```
 
 ### 2. Install (via miniforge3)
@@ -170,24 +182,25 @@ cp .env.example .env
 ```bash
 mamba create -n rsi python=3.10 -y
 mamba activate rsi
-pip install -r requirements.txt   # openai, pydo
+pip install -r requirements.txt
 ```
 
 ### 3. Run (API-only, no local training)
 
 ```bash
-source .env
 python -m rsi run \
   --problem matrix-vector \
   --meta-agent-profile profiles/kimi26-do.json \
   --target-agent-profile profiles/nemotron-do.json \
   --curator-profile profiles/curator-do.json \
-  --max-gen 5 \
+  --max-gen 10 \
   --run-id 001 \
   --run-dir ~/rsi_runs/runs
 ```
 
-### 4. Run with RSI (LoRA training on CPU)
+Each run appends to `runs/run-001/context.md` so the feedback agent builds on prior generations. Logs are saved to `runs/run-001/run.log`.
+
+### 4. Run with LoRA training on CPU
 
 ```bash
 # First provision a DO CPU droplet:
@@ -215,29 +228,31 @@ python -m rsi run \
 |---|---|---|
 | `MODEL_ACCESS_KEY` | `providers/do.json` | DO Model Studio inference key (`doo_v1_...`) |
 | `TENSARA_API_KEY` | `evaluate.py` | Tensara platform key |
-| `TENSARA_USERID` | `tensara_client.py` | Username for local submission cache |
+| `TENSARA_USERID` | `tensara_client.py` | Username for leaderboard submission |
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- `openai` and `pydo` Python packages
+- `openai` Python package
 - DO Model Studio `MODEL_ACCESS_KEY`
 - Tensara API key
 - *(for LoRA training)* CPU machine with llama.cpp built (`llama-finetune`, `llama-export-lora`)
 
 ---
 
-## RSI — what makes it recursive?
+## What makes it recursive?
 
-The loop is recursive because:
-- The model's own failures generate the next training batch
-- The training config adjusts based on ΔPerformance each generation
-- The fine-tuned model from gen N becomes the base for gen N+1
-- There is no human in the loop after generation 0
+Two self-improvement loops run simultaneously:
 
-This is an early-stage implementation of [Recursive Self-Improvement](https://en.wikipedia.org/wiki/Recursive_self-improvement) — models that bootstrap their own capabilities from their own mistakes.
+**Harness loop** (every gen): The feedback agent reads its own execution history and rewrites the agent script that drives code generation. The *strategy* improves.
+
+**Weight loop** (every gen, when enabled): The curator converts failures to training pairs; LoRA fine-tunes the base model on its own mistakes. The *model* improves.
+
+Both loops feed each other — a better harness produces better kernels, which produce richer training signal, which improves the model, which produces better kernels with fewer fallbacks needed from the harness.
+
+This is an early-stage implementation of [Recursive Self-Improvement](https://en.wikipedia.org/wiki/Recursive_self-improvement) — systems that bootstrap their own capabilities from their own failures, with no human in the loop after generation 0.
 
 ---
 
