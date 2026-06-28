@@ -39,6 +39,28 @@ from tensara_client import TensaraClient  # noqa: E402
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+class _Tee:
+    """Write to both a stream and a log file — used to tee stdout+stderr."""
+    def __init__(self, stream, path: Path):
+        self._stream = stream
+        self._path = path
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        with open(self._path, "a") as f:
+            f.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -302,6 +324,10 @@ def main() -> None:
     curator_profile = ROOT / args.curator_profile
     run_dir = Path(args.run_dir) / f"run-{args.run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = run_dir / "run.log"
+    sys.stdout = _Tee(sys.stdout, log_path)
+    sys.stderr = _Tee(sys.stderr, log_path)
 
     from rsi.train import HyperparamTracker, LoraConfig
     cfg = LoraConfig(rank=args.lora_rank, threads=args.threads)
