@@ -143,7 +143,44 @@ def run_target_agent(target_profile: Path, target_agent_path: Path, gdir: Path) 
     if not sol_path.exists():
         log("  [target] WARNING: sol.py not written by target agent")
     else:
+        sol_path = _clean_sol(sol_path)
         log(f"  [target] sol.py written ({sol_path.stat().st_size} bytes)")
+    return sol_path
+
+
+def _clean_sol(sol_path: Path) -> Path:
+    """
+    Strip reasoning/prose from sol.py — keep only Python code.
+
+    Kimi K2.5 (a thinking model) sometimes dumps its chain-of-thought
+    as plain text before or around the code block, producing an unterminated
+    string when the output is truncated at the token limit.
+
+    Strategy:
+    1. If a ```python ... ``` block exists, extract it.
+    2. Otherwise find the first line that looks like Python (import / def / @)
+       and keep everything from there on.
+    3. If neither, leave the file as-is (will fail static check with a clear error).
+    """
+    import re
+    raw = sol_path.read_text(encoding="utf-8", errors="replace")
+
+    # 1. Prefer an explicit ```python ... ``` fence
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", raw, re.DOTALL)
+    if m:
+        code = m.group(1).strip()
+        sol_path.write_text(code + "\n", encoding="utf-8")
+        return sol_path
+
+    # 2. Find the first Python-looking line
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        if re.match(r"^(import |from |def |@|class )", line.strip()):
+            code = "\n".join(lines[i:]).strip()
+            sol_path.write_text(code + "\n", encoding="utf-8")
+            return sol_path
+
+    # 3. Leave unchanged
     return sol_path
 
 
