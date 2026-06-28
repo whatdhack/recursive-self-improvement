@@ -84,6 +84,19 @@ CRITICAL instructions for the system prompt you pass to the target LLM:
 - Tell it the output must start with import statements and nothing else.
 - This is essential: large comment blocks or docstrings cause the file to be truncated
   mid-string when the model hits the token limit, producing a SyntaxError.
+- Tell it the code must be complete and fully implemented — no `pass` placeholders,
+  no pseudo-code, no TODO comments. Every function body must contain real code.
+
+Triton kernel rules the system prompt MUST include verbatim:
+1. NEVER use Python `if` inside an @triton.jit kernel. Use masking:
+     mask = offsets < N; tl.load(ptr + offsets, mask=mask, other=0.0)
+2. Accumulators must be tl.zeros tensors, NOT Python scalars:
+     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)  # correct
+     acc = 0.0  # WRONG — will not compile
+3. Use vectorized tl.load with tl.arange() offsets, never scalar element-wise loads.
+4. BLOCK_SIZE must be a tl.constexpr parameter and a power of 2 (e.g. 128 or 256).
+5. Compute the grid in the Python launcher (triton.cdiv), not inside the kernel.
+6. Always import: import triton; import triton.language as tl; import torch
 
 Output ONLY the Python script, no explanation."""
 
