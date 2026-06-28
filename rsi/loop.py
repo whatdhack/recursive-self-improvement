@@ -85,6 +85,33 @@ def read_json(path: Path) -> dict:
 
 # ── Step 1: Meta agent writes target_agent.py ────────────────────────────────
 
+# A minimal Triton matvec that compiles and runs correctly on H100.
+# Included verbatim in prompts so the LLM has a correct starting point.
+REFERENCE_KERNEL = '''\
+import triton
+import triton.language as tl
+import torch
+
+@triton.jit
+def matvec_kernel(A_ptr, x_ptr, y_ptr, M, N, BLOCK_N: tl.constexpr):
+    row = tl.program_id(0)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)
+        mask = cols < N
+        a = tl.load(A_ptr + row * N + cols, mask=mask, other=0.0)
+        x = tl.load(x_ptr + cols, mask=mask, other=0.0)
+        acc += a * x
+    tl.store(y_ptr + row, tl.sum(acc))
+
+def solution(A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    M, N = A.shape
+    y = torch.empty(M, device=A.device, dtype=A.dtype)
+    BLOCK_N = 256
+    matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N)
+    return y
+'''
+
 META_SYSTEM = """You are an expert AI engineer. Your job is to write a Python
 target agent script that will call an LLM to solve a GPU kernel coding task.
 
@@ -105,23 +132,23 @@ CRITICAL instructions for the system prompt you pass to the target LLM:
 - Tell it to output ONLY raw Python code — no markdown fences, no docstrings, no comments,
   no explanations, no task description echoed back. Code only.
 - Tell it the output must start with import statements and nothing else.
-- This is essential: large comment blocks or docstrings cause the file to be truncated
-  mid-string when the model hits the token limit, producing a SyntaxError.
-- Tell it the code must be complete and fully implemented — no `pass` placeholders,
-  no pseudo-code, no TODO comments. Every function body must contain real code.
+- Tell it the code must be complete and fully implemented — no pass placeholders.
 
-Triton kernel rules the system prompt MUST include verbatim:
-1. NEVER use Python `if` inside an @triton.jit kernel. Use masking:
-     mask = offsets < N; tl.load(ptr + offsets, mask=mask, other=0.0)
-2. Accumulators must be tl.zeros tensors, NOT Python scalars:
-     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)  # correct
-     acc = 0.0  # WRONG — will not compile
-3. Use vectorized tl.load with tl.arange() offsets, never scalar element-wise loads.
-4. BLOCK_SIZE must be a tl.constexpr parameter and a power of 2 (e.g. 128 or 256).
-5. Compute the grid in the Python launcher (triton.cdiv), not inside the kernel.
-6. Always import: import triton; import triton.language as tl; import torch
+The system prompt MUST include this EXACT reference kernel as a starting point.
+Tell the LLM to use this structure and only optimise from here — do NOT invent a
+different approach from scratch:
 
-Output ONLY the Python script, no explanation."""
+{reference_kernel}
+
+Triton rules the system prompt MUST enforce — deviations from the reference cause COMPILE_ERROR:
+1. NEVER use tl.zeros(()) — accumulator must be 1D: tl.zeros((BLOCK_N,), dtype=tl.float32)
+2. NEVER use tl.expand_dims — stick to 1D tiles and pointer arithmetic.
+3. NEVER use Python `if` inside @triton.jit — use mask= parameter on tl.load/tl.store.
+4. BLOCK_N must be tl.constexpr and a power of 2 (256 or 512).
+5. Grid: matvec_kernel[(M,)](...) — one program per row.
+6. Pointer arithmetic: A_ptr + row * N + cols  (row is scalar pid, cols is 1D arange).
+
+Output ONLY the Python script, no explanation.""".format(reference_kernel=REFERENCE_KERNEL)
 
 
 def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
@@ -165,16 +192,18 @@ The script must:
 5. Write the solution to OUTPUT_DIR/sol.py.
 
 ── MODE A: CORRECTNESS (status is not ACCEPTED) ──────────────────────────────
-Fix the specific error in the system prompt or add post-processing. Do NOT repeat
-approaches that already failed (check the history). Triton rules to enforce verbatim:
-1. NEVER use Python `if` inside @triton.jit — use masking:
-     mask = offsets < N; tl.load(ptr + offsets, mask=mask, other=0.0)
-2. Accumulators: tl.zeros((BLOCK_SIZE,), dtype=tl.float32) NOT acc = 0.0
-3. Vectorized tl.load with tl.arange() offsets only — no scalar element-wise loads.
-4. BLOCK_SIZE must be tl.constexpr and a power of 2 (128 or 256).
-5. Grid computed in Python launcher: grid = (triton.cdiv(M, BLOCK_SIZE),)
-6. Always import: import triton; import triton.language as tl; import torch
-7. Output ONLY raw Python code — no markdown fences, starts with imports, no pass.
+The LLM keeps generating kernels that fail to compile. Reset to this EXACT reference
+kernel — do not deviate from its structure. Only change BLOCK_N or add performance
+hints once correctness is confirmed:
+
+{reference_kernel}
+
+Rules that MUST appear verbatim in your system prompt:
+1. Use this exact kernel structure. Do NOT use tl.zeros(()) — must be tl.zeros((BLOCK_N,)).
+2. Do NOT use tl.expand_dims — stick to 1D tiles.
+3. NEVER use Python `if` inside @triton.jit — use mask= on tl.load/tl.store.
+4. BLOCK_N must be tl.constexpr and a power of 2 (256 or 512).
+5. Output ONLY raw Python code starting with imports, no markdown, no comments.
 
 ── MODE B: PERFORMANCE (status is ACCEPTED, GFLOPS below target) ─────────────
 The kernel is correct. Push for higher GFLOPS. Instruct the LLM to try:
@@ -189,7 +218,8 @@ The leaderboard target is {leaderboard_target:.1f} GFLOPS. Show the current GFLO
 and target in the system prompt so the LLM knows what to beat.
 
 Output ONLY the Python script for target_agent.py, no explanation.""".format(
-    leaderboard_target=LEADERBOARD_TARGET_GFLOPS
+    leaderboard_target=LEADERBOARD_TARGET_GFLOPS,
+    reference_kernel=REFERENCE_KERNEL,
 )
 
 
