@@ -148,12 +148,14 @@ def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
 
 # ── Step 1b: Feedback agent rewrites target_agent.py (gen 1+) ────────────────
 
+LEADERBOARD_TARGET_GFLOPS = 644.5  # H100 leaderboard #30 as of 2026-06-28
+
 FEEDBACK_SYSTEM = """You are an expert AI engineer improving a target agent script.
 
 The target agent calls an LLM to write a Triton GPU kernel (sol.py) that implements
-matrix-vector multiplication on an H100 GPU. The agent has been running but producing
-errors. Your job: read the previous target_agent.py, the sol.py it produced, the eval
-result, and the full generation history — then write an IMPROVED target_agent.py.
+matrix-vector multiplication on an H100 GPU. Your job: study the generation history,
+the previous target_agent.py, the sol.py it produced, and the eval result — then
+write an IMPROVED target_agent.py that either fixes errors or boosts performance.
 
 The script must:
 1. Read the task from the TASK_MD env var.
@@ -162,23 +164,62 @@ The script must:
 4. Extract content: resp.choices[0].message.content if not None, else reasoning_content.
 5. Write the solution to OUTPUT_DIR/sol.py.
 
-Triton rules the system prompt MUST enforce — include these verbatim:
+── MODE A: CORRECTNESS (status is not ACCEPTED) ──────────────────────────────
+Fix the specific error in the system prompt or add post-processing. Do NOT repeat
+approaches that already failed (check the history). Triton rules to enforce verbatim:
 1. NEVER use Python `if` inside @triton.jit — use masking:
      mask = offsets < N; tl.load(ptr + offsets, mask=mask, other=0.0)
-2. Accumulators must be tl.zeros tensors, NOT Python scalars:
-     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)  # correct
-     acc = 0.0  # WRONG
+2. Accumulators: tl.zeros((BLOCK_SIZE,), dtype=tl.float32) NOT acc = 0.0
 3. Vectorized tl.load with tl.arange() offsets only — no scalar element-wise loads.
 4. BLOCK_SIZE must be tl.constexpr and a power of 2 (128 or 256).
 5. Grid computed in Python launcher: grid = (triton.cdiv(M, BLOCK_SIZE),)
 6. Always import: import triton; import triton.language as tl; import torch
-7. Output ONLY raw Python code — no markdown fences, no comments, starts with imports.
-8. No pass placeholders. Every function body must be fully implemented.
+7. Output ONLY raw Python code — no markdown fences, starts with imports, no pass.
 
-Study the history and the previous sol.py carefully. Identify the specific error pattern
-and change the system prompt or add post-processing in the script to prevent it recurring.
+── MODE B: PERFORMANCE (status is ACCEPTED, GFLOPS below target) ─────────────
+The kernel is correct. Push for higher GFLOPS. Instruct the LLM to try:
+1. Use tl.dot() for the inner product — it maps to tensor core instructions on H100.
+   Pattern: reshape row block to (1, N) and x to (N, 1), use tl.dot.
+2. Increase BLOCK_SIZE to 256 or 512 for better memory throughput.
+3. Use multiple warps (num_warps=8) and stages (num_stages=4) in the triton.jit decorator.
+4. Process multiple rows per program using a 2D tile (BLOCK_ROWS × BLOCK_COLS).
+5. Use tl.load with eviction_policy='evict_last' for streaming access patterns.
+6. Align pointer arithmetic to 128-byte boundaries using tl.multiple_of().
+The leaderboard target is {leaderboard_target:.1f} GFLOPS. Show the current GFLOPS
+and target in the system prompt so the LLM knows what to beat.
 
-Output ONLY the Python script for target_agent.py, no explanation."""
+Output ONLY the Python script for target_agent.py, no explanation.""".format(
+    leaderboard_target=LEADERBOARD_TARGET_GFLOPS
+)
+
+
+def _perf_summary(results: dict) -> str:
+    """Format a compact performance summary from results.json for the feedback prompt."""
+    status = results.get("status", "UNKNOWN")
+    gflops = results.get("average_gflops")
+    latency = results.get("average_latency_ms")
+    error_msg = results.get("error_message", "")
+
+    lines = [f"Status: {status}"]
+    if gflops:
+        pct = gflops / LEADERBOARD_TARGET_GFLOPS * 100
+        lines.append(f"Performance: {gflops:.1f} GFLOPS  {latency:.3f} ms  "
+                     f"({pct:.1f}% of leaderboard target {LEADERBOARD_TARGET_GFLOPS:.1f} GFLOPS)")
+    if error_msg:
+        lines.append(f"Error: {error_msg}")
+
+    # Per-shape breakdown (when ACCEPTED)
+    details = results.get("details", [])
+    if details:
+        lines.append("Per-shape breakdown:")
+        for r in details:
+            name = r.get("name", "?")
+            g = r.get("gflops")
+            t = r.get("runtime_ms")
+            s = r.get("status", "?")
+            lines.append(f"  {name}: {s}  {g:.1f} GFLOPS  {t:.3f} ms" if g else f"  {name}: {s}")
+
+    return "\n".join(lines)
 
 
 def run_feedback_agent(
@@ -194,19 +235,27 @@ def run_feedback_agent(
     prev_script = prev_target_agent.read_text() if prev_target_agent and prev_target_agent.exists() else "(not available)"
     prev_code = prev_sol.read_text() if prev_sol and prev_sol.exists() else "(not available)"
     history = context_path.read_text() if context_path.exists() else "(no history yet)"
-    status = prev_results.get("status", "UNKNOWN")
-    detail = prev_results.get("error") or prev_results.get("message") or ""
+    perf = _perf_summary(prev_results)
+
+    is_accepted = prev_results.get("status") in ("ACCEPTED", "CHECKED", "SUCCESS")
+    mode = "B (performance)" if is_accepted else "A (correctness)"
 
     user_prompt = (
-        f"GENERATION HISTORY:\n{history}\n\n"
+        f"GENERATION HISTORY (one line per gen):\n{history}\n\n"
+        f"EVAL RESULT — mode {mode}:\n{perf}\n\n"
         f"PREVIOUS target_agent.py:\n```python\n{prev_script}\n```\n\n"
         f"WHAT IT PRODUCED (sol.py):\n```python\n{prev_code}\n```\n\n"
-        f"EVAL RESULT: {status}\n"
-        + (f"DETAIL: {detail}\n" if detail else "")
-        + "\nRewrite target_agent.py to fix the issues and produce a correct Triton kernel."
+        + (
+            f"The kernel is correct at {prev_results.get('average_gflops', 0):.1f} GFLOPS. "
+            f"Target is {LEADERBOARD_TARGET_GFLOPS:.1f} GFLOPS. "
+            "Rewrite target_agent.py to instruct the LLM to optimise for higher GFLOPS."
+            if is_accepted else
+            "Rewrite target_agent.py to fix the error and produce a correct Triton kernel. "
+            "Do NOT repeat approaches already tried in the history above."
+        )
     )
 
-    log("  [feedback] calling Kimi 2.6...")
+    log(f"  [feedback] calling Kimi 2.6 (mode {mode})...")
     code = run_agent(meta_profile, PROVIDER, FEEDBACK_SYSTEM, user_prompt)
 
     import re
@@ -219,14 +268,23 @@ def run_feedback_agent(
     return target_agent_path
 
 
-def update_context(context_path: Path, gen: int, status: str, results: dict) -> None:
+def update_context(context_path: Path, gen: int, status: str, results: dict, prev_gflops: float | None = None) -> None:
     gflops = results.get("average_gflops")
-    detail = results.get("error") or results.get("message") or ""
+    latency = results.get("average_latency_ms")
+    error_msg = results.get("error_message", "")
+
     line = f"Gen {gen}: {status}"
     if gflops:
-        line += f" — {gflops:.1f} GFLOPS"
-    if detail:
-        line += f" — {detail}"
+        pct = gflops / LEADERBOARD_TARGET_GFLOPS * 100
+        line += f" — {gflops:.1f} GFLOPS  {latency:.3f} ms  ({pct:.1f}% of target)"
+        if prev_gflops:
+            delta = gflops - prev_gflops
+            line += f"  Δ{delta:+.1f} GFLOPS"
+    if error_msg:
+        # Keep it to one line — first line of the error is most useful
+        first_line = error_msg.splitlines()[0][:120]
+        line += f" — {first_line}"
+
     with open(context_path, "a") as f:
         f.write(line + "\n")
 
@@ -463,7 +521,8 @@ def main() -> None:
         write_json(gdir / "results.json", results)
 
         # Update context and carry state forward for the feedback agent
-        update_context(context_path, gen, status, results)
+        prev_gflops = prev_results.get("average_gflops")
+        update_context(context_path, gen, status, results, prev_gflops)
         prev_target_agent = target_agent_path
         prev_sol = sol_path
         prev_results = results
