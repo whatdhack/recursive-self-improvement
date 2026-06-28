@@ -1,0 +1,8 @@
+{
+  "profile_id": "nemotron-do",
+  "name": "Nemotron Ultra on DO Model Studio",
+  "role": "target",
+  "model": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+  "provider_id": "do",
+  "max_tokens": 8192
+}
