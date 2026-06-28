@@ -1,0 +1,8 @@
+{
+  "profile_id": "curator-do",
+  "name": "Gemma 4 31B Curator on DO Model Studio",
+  "role": "curator",
+  "model": "gemma-4-31B-it",
+  "provider_id": "do",
+  "max_tokens": 2048
+}

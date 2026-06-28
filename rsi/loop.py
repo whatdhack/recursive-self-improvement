@@ -67,9 +67,16 @@ target agent script that will call an LLM to solve a GPU kernel coding task.
 
 The script must:
 1. Read the task description from the file path given in the environment variable TASK_MD.
-2. Call the LLM (using OPENAI_BASE_URL and OPENAI_API_KEY env vars, model MODEL_NAME).
-3. Write the solution to sol.py in the directory given by OUTPUT_DIR env var.
-4. The solution must be a valid Triton kernel implementing the `solution` function.
+2. Call the LLM using the openai Python package with:
+   - base_url from env var OPENAI_BASE_URL
+   - api_key from env var OPENAI_API_KEY
+   - model name from env var MODEL_NAME
+   - max_tokens=8000 (required — the model needs space to think and then produce code)
+3. Extract the response text: use resp.choices[0].message.content if it is not None,
+   otherwise fall back to resp.choices[0].message.reasoning_content (some models are
+   thinking models that put the final answer in reasoning_content when content is None).
+4. Write the solution to sol.py in the directory given by OUTPUT_DIR env var.
+5. The solution must be a valid Triton kernel implementing the `solution` function.
 
 Output ONLY the Python script, no explanation."""
 
@@ -117,7 +124,7 @@ def run_target_agent(target_profile: Path, target_agent_path: Path, gdir: Path) 
         env=env,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
     )
 
     if result.stdout:
@@ -156,7 +163,7 @@ def run_curate_and_train(
     run_dir: Path,
     results: dict,
     gen: int,
-    meta_profile: Path,
+    curator_profile: Path,
     cfg,
     tracker,
     args,
@@ -172,7 +179,7 @@ def run_curate_and_train(
     if status not in ("ACCEPTED", "CHECKED", "SUCCESS") and sol_path.exists():
         log("  [curate] generating training pair from failure...")
         failed_code = sol_path.read_text()
-        pair = curate_via_api(failed_code, results, meta_profile, PROVIDER)
+        pair = curate_via_api(failed_code, results, curator_profile, PROVIDER)
         if pair:
             append_to_jsonl(pair, train_jsonl)
         else:
@@ -220,6 +227,7 @@ def main() -> None:
     parser.add_argument("--problem", default="matrix-vector")
     parser.add_argument("--meta-agent-profile", default="profiles/kimi26-do.json")
     parser.add_argument("--target-agent-profile", default="profiles/nemotron-do.json")
+    parser.add_argument("--curator-profile", default="profiles/curator-do.json")
     parser.add_argument("--max-gen", type=int, default=10)
     parser.add_argument("--run-id", default="001")
     parser.add_argument("--gpu-type", default="H100")
@@ -234,6 +242,7 @@ def main() -> None:
 
     meta_profile = ROOT / args.meta_agent_profile
     target_profile = ROOT / args.target_agent_profile
+    curator_profile = ROOT / args.curator_profile
     run_dir = Path(args.run_dir) / f"run-{args.run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,7 +284,7 @@ def main() -> None:
 
         # Steps 4+5: Curate + Train
         cfg, tracker = run_curate_and_train(
-            gdir, run_dir, results, gen, meta_profile, cfg, tracker, args
+            gdir, run_dir, results, gen, curator_profile, cfg, tracker, args
         )
 
         print("─" * 60)

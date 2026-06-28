@@ -2,7 +2,7 @@
   "profile_id": "kimi26-do",
   "name": "Kimi 2.6 on DO Model Studio",
   "role": "meta",
-  "model": "moonshot/kimi-k2-5",
+  "model": "kimi-k2.6",
   "provider_id": "do",
   "max_tokens": 8192
 }

@@ -2,6 +2,6 @@
   "provider_id": "do",
   "name": "DigitalOcean Model Studio",
   "client_kind": "openai",
-  "base_url": "https://api.digitalocean.com/v1/inference/",
-  "api_key_env": "DO_API_KEY"
+  "base_url": "https://inference.do-ai.run/v1/",
+  "api_key_env": "MODEL_ACCESS_KEY"
 }
