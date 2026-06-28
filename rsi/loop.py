@@ -2,8 +2,9 @@
 RSI Orchestrator — Recursive Self-Improvement loop.
 
 5-step cycle per generation:
-  1. Meta agent  (Kimi 2.6)    writes target_agent.py
-  2. Target agent (Nemotron)   runs target_agent.py → sol.py
+  1. Meta agent  (Kimi 2.6)    writes target_agent.py  [gen 0 only]
+     Feedback agent (Kimi 2.6) rewrites target_agent.py from prior script+errors [gen 1+]
+  2. Target agent (Kimi 2.5)   runs target_agent.py → sol.py
   3. Evaluate    (Tensara)     checks correctness + benchmarks on H100
   4. Curate                    failure logs → train.jsonl entry
   5. Train       (llama-finetune)  LoRA updates Gemma4-1B weights
@@ -143,6 +144,91 @@ def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
     target_agent_path.write_text(code)
     log(f"  [meta] wrote target_agent.py ({len(code)} chars)")
     return target_agent_path
+
+
+# ── Step 1b: Feedback agent rewrites target_agent.py (gen 1+) ────────────────
+
+FEEDBACK_SYSTEM = """You are an expert AI engineer improving a target agent script.
+
+The target agent calls an LLM to write a Triton GPU kernel (sol.py) that implements
+matrix-vector multiplication on an H100 GPU. The agent has been running but producing
+errors. Your job: read the previous target_agent.py, the sol.py it produced, the eval
+result, and the full generation history — then write an IMPROVED target_agent.py.
+
+The script must:
+1. Read the task from the TASK_MD env var.
+2. Call the LLM via openai (OPENAI_BASE_URL, OPENAI_API_KEY, MODEL_NAME env vars).
+3. Use max_tokens=8000.
+4. Extract content: resp.choices[0].message.content if not None, else reasoning_content.
+5. Write the solution to OUTPUT_DIR/sol.py.
+
+Triton rules the system prompt MUST enforce — include these verbatim:
+1. NEVER use Python `if` inside @triton.jit — use masking:
+     mask = offsets < N; tl.load(ptr + offsets, mask=mask, other=0.0)
+2. Accumulators must be tl.zeros tensors, NOT Python scalars:
+     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)  # correct
+     acc = 0.0  # WRONG
+3. Vectorized tl.load with tl.arange() offsets only — no scalar element-wise loads.
+4. BLOCK_SIZE must be tl.constexpr and a power of 2 (128 or 256).
+5. Grid computed in Python launcher: grid = (triton.cdiv(M, BLOCK_SIZE),)
+6. Always import: import triton; import triton.language as tl; import torch
+7. Output ONLY raw Python code — no markdown fences, no comments, starts with imports.
+8. No pass placeholders. Every function body must be fully implemented.
+
+Study the history and the previous sol.py carefully. Identify the specific error pattern
+and change the system prompt or add post-processing in the script to prevent it recurring.
+
+Output ONLY the Python script for target_agent.py, no explanation."""
+
+
+def run_feedback_agent(
+    meta_profile: Path,
+    gdir: Path,
+    prev_target_agent: Path,
+    prev_sol: Path,
+    prev_results: dict,
+    context_path: Path,
+) -> Path:
+    from rsi.agent import run_agent
+
+    prev_script = prev_target_agent.read_text() if prev_target_agent and prev_target_agent.exists() else "(not available)"
+    prev_code = prev_sol.read_text() if prev_sol and prev_sol.exists() else "(not available)"
+    history = context_path.read_text() if context_path.exists() else "(no history yet)"
+    status = prev_results.get("status", "UNKNOWN")
+    detail = prev_results.get("error") or prev_results.get("message") or ""
+
+    user_prompt = (
+        f"GENERATION HISTORY:\n{history}\n\n"
+        f"PREVIOUS target_agent.py:\n```python\n{prev_script}\n```\n\n"
+        f"WHAT IT PRODUCED (sol.py):\n```python\n{prev_code}\n```\n\n"
+        f"EVAL RESULT: {status}\n"
+        + (f"DETAIL: {detail}\n" if detail else "")
+        + "\nRewrite target_agent.py to fix the issues and produce a correct Triton kernel."
+    )
+
+    log("  [feedback] calling Kimi 2.6...")
+    code = run_agent(meta_profile, PROVIDER, FEEDBACK_SYSTEM, user_prompt)
+
+    import re
+    code = re.sub(r"^```python\s*", "", code.strip())
+    code = re.sub(r"\s*```$", "", code)
+
+    target_agent_path = gdir / "target_agent.py"
+    target_agent_path.write_text(code)
+    log(f"  [feedback] wrote target_agent.py ({len(code)} chars)")
+    return target_agent_path
+
+
+def update_context(context_path: Path, gen: int, status: str, results: dict) -> None:
+    gflops = results.get("average_gflops")
+    detail = results.get("error") or results.get("message") or ""
+    line = f"Gen {gen}: {status}"
+    if gflops:
+        line += f" — {gflops:.1f} GFLOPS"
+    if detail:
+        line += f" — {detail}"
+    with open(context_path, "a") as f:
+        f.write(line + "\n")
 
 
 # ── Step 2: Target agent runs and writes sol.py ───────────────────────────────
@@ -333,6 +419,11 @@ def main() -> None:
     cfg = LoraConfig(rank=args.lora_rank, threads=args.threads)
     tracker = HyperparamTracker()
 
+    context_path = run_dir / "context.md"
+    prev_target_agent: Path | None = None
+    prev_sol: Path | None = None
+    prev_results: dict = {}
+
     print(f"\nRSI Loop — {args.problem}  (GPU: {args.gpu_type})")
     print("─" * 60)
 
@@ -340,11 +431,17 @@ def main() -> None:
         gdir = gen_dir(run_dir, gen)
         log(f"\n[Gen {gen}] starting")
 
-        # Step 1: Meta agent
+        # Step 1: Meta agent bootstraps gen 0; feedback agent rewrites for gen 1+
         try:
-            target_agent_path = run_meta_agent(meta_profile, gdir)
+            if gen == 0:
+                target_agent_path = run_meta_agent(meta_profile, gdir)
+            else:
+                target_agent_path = run_feedback_agent(
+                    meta_profile, gdir,
+                    prev_target_agent, prev_sol, prev_results, context_path,
+                )
         except Exception as e:
-            log(f"[Gen {gen}] meta agent failed: {e}")
+            log(f"[Gen {gen}] agent failed: {e}")
             continue
 
         # Step 2: Target agent
@@ -364,6 +461,12 @@ def main() -> None:
         perf_str = f"{gflops:.1f} GFLOPS  {latency:.2f} ms" if gflops else "N/A"
         log(f"[Gen {gen}] Tensara: {status}  |  {perf_str}")
         write_json(gdir / "results.json", results)
+
+        # Update context and carry state forward for the feedback agent
+        update_context(context_path, gen, status, results)
+        prev_target_agent = target_agent_path
+        prev_sol = sol_path
+        prev_results = results
 
         # Steps 4+5: Curate + Train
         cfg, tracker = run_curate_and_train(
