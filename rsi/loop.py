@@ -78,6 +78,13 @@ The script must:
 4. Write the solution to sol.py in the directory given by OUTPUT_DIR env var.
 5. The solution must be a valid Triton kernel implementing the `solution` function.
 
+CRITICAL instructions for the system prompt you pass to the target LLM:
+- Tell it to output ONLY raw Python code — no markdown fences, no docstrings, no comments,
+  no explanations, no task description echoed back. Code only.
+- Tell it the output must start with import statements and nothing else.
+- This is essential: large comment blocks or docstrings cause the file to be truncated
+  mid-string when the model hits the token limit, producing a SyntaxError.
+
 Output ONLY the Python script, no explanation."""
 
 
