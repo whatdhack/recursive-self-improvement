@@ -264,7 +264,7 @@ def run_tensara_checker(
     """Check correctness against the reference implementation before benchmarking."""
     print(f"Checking correctness on Tensara for problem '{slug}' (language: {language})...")
     try:
-        stream = client.run_checker(slug, code, dtype="float16", language=language, gpu_type=gpu_type)
+        stream = client.run_checker(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
     except Exception as e:
         return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
     try:
@@ -279,7 +279,7 @@ def run_tensara_benchmark(
     """Run benchmark on Tensara and parse streaming SSE results."""
     print(f"Running benchmark on Tensara for problem '{slug}' (language: {language})...")
     try:
-        stream = client.run_benchmark(slug, code, dtype="float16", language=language, gpu_type=gpu_type)
+        stream = client.run_benchmark(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
     except Exception as e:
         return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
     try:

@@ -99,127 +99,277 @@ def matvec_kernel(A_ptr, x_ptr, y_ptr, M, N, BLOCK_N: tl.constexpr):
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)
         mask = cols < N
-        a = tl.load(A_ptr + row * N + cols, mask=mask, other=0.0)
-        x = tl.load(x_ptr + cols, mask=mask, other=0.0)
+        a = tl.load(A_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         acc += a * x
-    tl.store(y_ptr + row, tl.sum(acc))
+    tl.store(y_ptr + row, tl.sum(acc, axis=0))
 
 def solution(A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     M, N = A.shape
-    y = torch.empty(M, device=A.device, dtype=A.dtype)
+    y = torch.empty(M, device=A.device, dtype=torch.float32)
     BLOCK_N = 256
     matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N)
     return y
 '''
 
-META_SYSTEM = """You are an expert AI engineer. Your job is to write a Python
-target agent script that will call an LLM to solve a GPU kernel coding task.
-
-The script must:
-1. Read the task description from the file path given in the environment variable TASK_MD.
-2. Call the LLM using the openai Python package with:
-   - base_url from env var OPENAI_BASE_URL
-   - api_key from env var OPENAI_API_KEY
-   - model name from env var MODEL_NAME
-   - max_tokens=8000 (required — the model needs space to think and then produce code)
-3. Extract the response text: use resp.choices[0].message.content if it is not None,
-   otherwise fall back to resp.choices[0].message.reasoning_content (some models are
-   thinking models that put the final answer in reasoning_content when content is None).
-4. Write the solution to sol.py in the directory given by OUTPUT_DIR env var.
-5. The solution must be a valid Triton kernel implementing the `solution` function.
-
-CRITICAL instructions for the system prompt you pass to the target LLM:
-- Tell it to output ONLY raw Python code — no markdown fences, no docstrings, no comments,
-  no explanations, no task description echoed back. Code only.
-- Tell it the output must start with import statements and nothing else.
-- Tell it the code must be complete and fully implemented — no pass placeholders.
-
-The system prompt MUST include this EXACT reference kernel as a starting point.
-Tell the LLM to use this structure and only optimise from here — do NOT invent a
-different approach from scratch:
-
-{reference_kernel}
-
-Triton rules the system prompt MUST enforce — deviations from the reference cause COMPILE_ERROR:
-1. NEVER use tl.zeros(()) — accumulator must be 1D: tl.zeros((BLOCK_N,), dtype=tl.float32)
-2. NEVER use tl.expand_dims — stick to 1D tiles and pointer arithmetic.
-3. NEVER use Python `if` inside @triton.jit — use mask= parameter on tl.load/tl.store.
-4. BLOCK_N must be tl.constexpr and a power of 2 (256 or 512).
-5. Grid: matvec_kernel[(M,)](...) — one program per row.
-6. Pointer arithmetic: A_ptr + row * N + cols  (row is scalar pid, cols is 1D arange).
-
-Output ONLY the Python script, no explanation.""".format(reference_kernel=REFERENCE_KERNEL)
-
-
-def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
-    from rsi.agent import run_agent
-
-    task_md = (TASK_DIR / "task.md").read_text()
-    user_prompt = (
-        f"Write the target agent script for this task:\n\n{task_md}\n\n"
-        "The script should instruct the LLM to write a Triton kernel sol.py."
-    )
-    log("  [meta] calling Kimi 2.6...")
-    code = run_agent(meta_profile, PROVIDER, META_SYSTEM, user_prompt)
-
-    # Strip markdown fences if present
-    import re
-    code = re.sub(r"^```python\s*", "", code.strip())
-    code = re.sub(r"\s*```$", "", code)
-
-    target_agent_path = gdir / "target_agent.py"
-    target_agent_path.write_text(code)
-    log(f"  [meta] wrote target_agent.py ({len(code)} chars)")
-    return target_agent_path
-
-
-# ── Step 1b: Feedback agent rewrites target_agent.py (gen 1+) ────────────────
+# ── Shared agentic loop (used by meta AND feedback agents) ────────────────────
 
 LEADERBOARD_TARGET_GFLOPS = 644.5  # H100 leaderboard #30 as of 2026-06-28
 
-FEEDBACK_SYSTEM = """You are an expert AI engineer improving a target agent script.
 
-The target agent calls an LLM to write a Triton GPU kernel (sol.py) that implements
-matrix-vector multiplication on an H100 GPU. Your job: study the generation history,
-the previous target_agent.py, the sol.py it produced, and the eval result — then
-write an IMPROVED target_agent.py that either fixes errors or boosts performance.
+def _run_agentic_loop(
+    model: str,
+    api_key: str,
+    base_url: str,
+    system_prompt: str,
+    user_message: str,
+    max_turns: int = 8,
+) -> list:
+    """Agentic loop with write_file, read_file, bash tools. Returns message history."""
+    from openai import OpenAI
 
-The script must:
-1. Read the task from the TASK_MD env var.
-2. Call the LLM via openai (OPENAI_BASE_URL, OPENAI_API_KEY, MODEL_NAME env vars).
-3. Use max_tokens=8000.
-4. Extract content: resp.choices[0].message.content if not None, else reasoning_content.
-5. Write the solution to OUTPUT_DIR/sol.py.
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
-── MODE A: CORRECTNESS (status is not ACCEPTED) ──────────────────────────────
-The LLM keeps generating kernels that fail to compile. Reset to this EXACT reference
-kernel — do not deviate from its structure. Only change BLOCK_N or add performance
-hints once correctness is confirmed:
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file on disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read and return the full contents of a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command, return stdout + stderr.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
 
+    def _write(path: str, content: str) -> str:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Written {len(content)} chars to {path}."
+
+    def _read(path: str) -> str:
+        try:
+            return open(path, encoding="utf-8").read()
+        except FileNotFoundError:
+            return f"Error: {path} not found."
+        except Exception as e:
+            return f"Error reading {path}: {e}"
+
+    def _bash(cmd: str) -> str:
+        if isinstance(cmd, list):
+            cmd = " ".join(str(c) for c in cmd)
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            out = r.stdout
+            if r.stderr:
+                out += "\n[stderr]\n" + r.stderr
+            return out.strip() or "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Error: timed out after 60s"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _dispatch(name: str, args: dict) -> str:
+        if name == "write_file":
+            return _write(**args)
+        elif name == "read_file":
+            return _read(**args)
+        elif name == "bash":
+            cmd = args.get("command", args.get("cmd", ""))
+            return _bash(cmd)
+        return f"Unknown tool: {name}"
+
+    messages: list[dict] = [{"role": "user", "content": user_message}]
+
+    for turn in range(max_turns):
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=4000,
+        )
+        msg = response.choices[0].message
+
+        if msg.content:
+            print(f"    [turn {turn}] {msg.content[:200]}")
+
+        if not msg.tool_calls:
+            break
+
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ],
+        })
+
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            result = _dispatch(tc.function.name, args)
+            print(f"    [{tc.function.name}] → {result[:300]}")
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    return messages
+
+
+# ── Step 1: Meta agent (agentic loop, like siawdh) ────────────────────────────
+
+META_SYSTEM = """You are an expert AI engineer. Your task: write target_agent.py for a Triton GPU kernel task.
+
+WHAT YOU MUST DO:
+1. read_file the reference agent (path given in the user message) — study its structure
+2. read_file the task description (path given in the user message)
+3. write_file a custom target_agent.py at the output path given in the user message
+
+The target_agent.py will be run with env vars:
+  OPENAI_BASE_URL, OPENAI_API_KEY, MODEL_NAME  — LLM connection
+  TASK_MD                                       — path to task.md
+  OUTPUT_DIR                                    — directory to write sol.py, results.json
+
+It must have write_file, read_file, bash tools and an agent loop that:
+  1. Writes a Triton kernel to OUTPUT_DIR/sol.py (start from the REFERENCE KERNEL below)
+  2. Validates: python -m py_compile <sol_path>
+  3. Evaluates: python <evaluate_py> --gen-dir <OUTPUT_DIR> --problem matrix-vector
+  4. Reads results.json, fixes errors, iterates until ACCEPTED
+  5. After ACCEPTED: tries to improve GFLOPS (bigger BLOCK_N, num_warps=8)
+
+The SYSTEM_PROMPT inside target_agent.py MUST include:
+
+REFERENCE KERNEL (agent starts here — copy verbatim):
 {reference_kernel}
 
-Rules that MUST appear verbatim in your system prompt:
-1. Use this exact kernel structure. Do NOT use tl.zeros(()) — must be tl.zeros((BLOCK_N,)).
-2. Do NOT use tl.expand_dims — stick to 1D tiles.
-3. NEVER use Python `if` inside @triton.jit — use mask= on tl.load/tl.store.
-4. BLOCK_N must be tl.constexpr and a power of 2 (256 or 512).
-5. Output ONLY raw Python code starting with imports, no markdown, no comments.
+TRITON RULES (include verbatim in SYSTEM_PROMPT):
+1. tl.zeros((BLOCK_N,), dtype=tl.float32) — NEVER tl.zeros(())
+2. NO tl.expand_dims
+3. NO Python `if` inside @triton.jit — use mask= on tl.load/tl.store
+4. BLOCK_N must be tl.constexpr and a power of 2 (256 or 512)
+5. One program per row: row = tl.program_id(0), grid = (M,)
+6. Explicit type cast on loads: .to(tl.float32)
 
-── MODE B: PERFORMANCE (status is ACCEPTED, GFLOPS below target) ─────────────
-The kernel is correct. Push for higher GFLOPS. Instruct the LLM to try:
-1. Use tl.dot() for the inner product — it maps to tensor core instructions on H100.
-   Pattern: reshape row block to (1, N) and x to (N, 1), use tl.dot.
-2. Increase BLOCK_SIZE to 256 or 512 for better memory throughput.
-3. Use multiple warps (num_warps=8) and stages (num_stages=4) in the triton.jit decorator.
-4. Process multiple rows per program using a 2D tile (BLOCK_ROWS × BLOCK_COLS).
-5. Use tl.load with eviction_policy='evict_last' for streaming access patterns.
-6. Align pointer arithmetic to 128-byte boundaries using tl.multiple_of().
-The leaderboard target is {leaderboard_target:.1f} GFLOPS. Show the current GFLOPS
-and target in the system prompt so the LLM knows what to beat.
-
-Output ONLY the Python script for target_agent.py, no explanation.""".format(
-    leaderboard_target=LEADERBOARD_TARGET_GFLOPS,
+Write ONLY target_agent.py using write_file. Do not print the code.""".format(
     reference_kernel=REFERENCE_KERNEL,
+)
+
+
+def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
+    provider_data = json.loads(PROVIDER.read_text())
+    meta_data = json.loads(meta_profile.read_text())
+    api_key = os.environ.get(provider_data["api_key_env"], "")
+
+    reference_path = TASK_DIR / "reference_target_agent.py"
+    task_md_path   = TASK_DIR / "task.md"
+    target_agent_path = gdir / "target_agent.py"
+    evaluate_py = TASK_DIR / "evaluate.py"
+
+    user_message = (
+        f"Reference agent to study: {reference_path}\n"
+        f"Task description: {task_md_path}\n"
+        f"evaluate.py path: {evaluate_py}\n"
+        f"Write target_agent.py to: {target_agent_path}\n\n"
+        "Read the reference agent first, then write the adapted target_agent.py."
+    )
+
+    log("  [meta] agentic loop (Kimi 2.6)...")
+    _run_agentic_loop(
+        model=meta_data["model"],
+        api_key=api_key,
+        base_url=provider_data["base_url"],
+        system_prompt=META_SYSTEM,
+        user_message=user_message,
+        max_turns=6,
+    )
+
+    if not target_agent_path.exists():
+        log("  [meta] WARNING: target_agent.py not written — falling back to reference scaffold")
+        import shutil
+        shutil.copy(reference_path, target_agent_path)
+
+    size = target_agent_path.stat().st_size
+    log(f"  [meta] wrote target_agent.py ({size} bytes)")
+    return target_agent_path
+
+
+# ── Step 1b: Feedback agent (agentic loop, like siawdh) ──────────────────────
+
+FEEDBACK_SYSTEM = """You are an expert AI engineer improving a GPU kernel agent across generations.
+
+WHAT YOU MUST DO:
+1. read_file context.md (path given) — understand the full history of what was tried
+2. read_file results.json from the previous generation (path given) — see what failed
+3. read_file the previous target_agent.py (path given) — see the current implementation
+4. read_file sol.py from the previous generation (path given) — see the kernel produced
+5. read_file agent_execution.json (path given) — see the full tool call trace of what the agent tried
+6. (optional) read_file earlier improvement.md files to avoid repeating past mistakes
+7. write_file improvement.md — analysis: what went wrong, what to fix, what to try next
+8. write_file target_agent.py — improved agent that addresses the issues found
+
+── MODE A: CORRECTNESS (status is not ACCEPTED) ──────────────────────────────
+The kernel is failing. The SYSTEM_PROMPT inside target_agent.py must include:
+
+REFERENCE KERNEL (agent MUST start from this — embed it verbatim):
+{reference_kernel}
+
+TRITON RULES (always include all of these):
+1. tl.zeros((BLOCK_N,), dtype=tl.float32) — NEVER tl.zeros(())
+2. NO tl.expand_dims
+3. NO Python `if` inside @triton.jit — use mask=
+4. BLOCK_N must be tl.constexpr and a power of 2
+5. One program per row: row = tl.program_id(0), grid = (M,)
+6. Explicit type cast: a = tl.load(...).to(tl.float32)
+
+── MODE B: PERFORMANCE (status is ACCEPTED) ──────────────────────────────────
+The kernel is correct. Push for higher GFLOPS in the SYSTEM_PROMPT:
+- Larger BLOCK_N (512, 1024)
+- tl.dot() for tensor cores
+- num_warps=8, num_stages=4
+- Multi-row tiles (BLOCK_ROWS × BLOCK_N)
+- Leaderboard target: {leaderboard_target:.1f} GFLOPS
+
+Write BOTH files using write_file — improvement.md first, then target_agent.py.""".format(
+    reference_kernel=REFERENCE_KERNEL,
+    leaderboard_target=LEADERBOARD_TARGET_GFLOPS,
 )
 
 
@@ -260,41 +410,62 @@ def run_feedback_agent(
     prev_results: dict,
     context_path: Path,
 ) -> Path:
-    from rsi.agent import run_agent
-
-    prev_script = prev_target_agent.read_text() if prev_target_agent and prev_target_agent.exists() else "(not available)"
-    prev_code = prev_sol.read_text() if prev_sol and prev_sol.exists() else "(not available)"
-    history = context_path.read_text() if context_path.exists() else "(no history yet)"
-    perf = _perf_summary(prev_results)
+    provider_data = json.loads(PROVIDER.read_text())
+    meta_data = json.loads(meta_profile.read_text())
+    api_key = os.environ.get(provider_data["api_key_env"], "")
 
     is_accepted = prev_results.get("status") in ("ACCEPTED", "CHECKED", "SUCCESS")
     mode = "B (performance)" if is_accepted else "A (correctness)"
-
-    user_prompt = (
-        f"GENERATION HISTORY (one line per gen):\n{history}\n\n"
-        f"EVAL RESULT — mode {mode}:\n{perf}\n\n"
-        f"PREVIOUS target_agent.py:\n```python\n{prev_script}\n```\n\n"
-        f"WHAT IT PRODUCED (sol.py):\n```python\n{prev_code}\n```\n\n"
-        + (
-            f"The kernel is correct at {prev_results.get('average_gflops', 0):.1f} GFLOPS. "
-            f"Target is {LEADERBOARD_TARGET_GFLOPS:.1f} GFLOPS. "
-            "Rewrite target_agent.py to instruct the LLM to optimise for higher GFLOPS."
-            if is_accepted else
-            "Rewrite target_agent.py to fix the error and produce a correct Triton kernel. "
-            "Do NOT repeat approaches already tried in the history above."
-        )
-    )
-
-    log(f"  [feedback] calling Kimi 2.6 (mode {mode})...")
-    code = run_agent(meta_profile, PROVIDER, FEEDBACK_SYSTEM, user_prompt)
-
-    import re
-    code = re.sub(r"^```python\s*", "", code.strip())
-    code = re.sub(r"\s*```$", "", code)
+    perf = _perf_summary(prev_results)
 
     target_agent_path = gdir / "target_agent.py"
-    target_agent_path.write_text(code)
-    log(f"  [feedback] wrote target_agent.py ({len(code)} chars)")
+    improvement_path  = gdir / "improvement.md"
+    prev_results_path   = prev_target_agent.parent / "results.json"        if prev_target_agent else None
+    prev_execution_path = prev_target_agent.parent / "agent_execution.json" if prev_target_agent else None
+    evaluate_py = TASK_DIR / "evaluate.py"
+
+    # Build list of previous improvement.md files for context
+    prev_improvements = []
+    if prev_target_agent:
+        for g in sorted(prev_target_agent.parent.parent.iterdir()):
+            imp = g / "improvement.md"
+            if imp.exists() and imp != improvement_path:
+                prev_improvements.append(str(imp))
+
+    user_message = (
+        f"Mode: {mode}\n"
+        f"Latest eval result:\n{perf}\n\n"
+        f"Files to read:\n"
+        f"  context.md:            {context_path}\n"
+        f"  prev target_agent.py:  {prev_target_agent or 'N/A'}\n"
+        f"  prev sol.py:           {prev_sol or 'N/A'}\n"
+        f"  prev results.json:     {prev_results_path or 'N/A'}\n"
+        f"  prev agent_execution.json: {prev_execution_path or 'N/A'}\n"
+        + (f"  earlier improvements:  {', '.join(prev_improvements)}\n" if prev_improvements else "")
+        + f"\nFiles to write:\n"
+        f"  improvement.md:        {improvement_path}\n"
+        f"  target_agent.py:       {target_agent_path}\n"
+        f"  evaluate.py path:      {evaluate_py}\n\n"
+        "Read all context files first, then write improvement.md and target_agent.py."
+    )
+
+    log(f"  [feedback] agentic loop (Kimi 2.6, mode {mode})...")
+    _run_agentic_loop(
+        model=meta_data["model"],
+        api_key=api_key,
+        base_url=provider_data["base_url"],
+        system_prompt=FEEDBACK_SYSTEM,
+        user_message=user_message,
+        max_turns=8,
+    )
+
+    if not target_agent_path.exists():
+        log("  [feedback] WARNING: target_agent.py not written — falling back to reference scaffold")
+        import shutil
+        shutil.copy(TASK_DIR / "reference_target_agent.py", target_agent_path)
+
+    size = target_agent_path.stat().st_size
+    log(f"  [feedback] wrote target_agent.py ({size} bytes)")
     return target_agent_path
 
 
@@ -340,7 +511,7 @@ def run_target_agent(target_profile: Path, target_agent_path: Path, gdir: Path) 
         env=env,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=900,
     )
 
     if result.stdout:
