@@ -668,7 +668,7 @@ def main():
     # Save to ownbest/tensara/ if ACCEPTED and beats current best on file.
     if status == "ACCEPTED":
         run_id = os.environ.get("SIA_RUN_ID", "")
-        save_ownbest(script_dir.parent.parent, slug, language, args.gpu_type, code, eval_results, run_id=run_id)
+        save_ownbest(script_dir, slug, language, args.gpu_type, code, eval_results, run_id=run_id)
 
     # Submit to leaderboard if --submit and ACCEPTED and beats our own previous best.
     if args.submit and status == "ACCEPTED" and avg_latency is not None:
