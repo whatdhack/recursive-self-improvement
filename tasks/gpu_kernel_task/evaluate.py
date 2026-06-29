@@ -18,6 +18,7 @@ import os
 import ast
 import json
 import argparse
+import time
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime
@@ -258,34 +259,50 @@ def _parse_sse_stream(stream) -> Dict[str, Any]:
     }
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True if the exception is an HTTP 429 / rate limit."""
+    msg = str(exc)
+    return "429" in msg or "rate limit" in msg.lower()
+
+
 def run_tensara_checker(
     client: TensaraClient, slug: str, code: str, language: str, gpu_type: str = "H100"
 ) -> Dict[str, Any]:
-    """Check correctness against the reference implementation before benchmarking."""
+    """Check correctness against the reference implementation before benchmarking.
+    Retries automatically on HTTP 429 with exponential backoff."""
     print(f"Checking correctness on Tensara for problem '{slug}' (language: {language})...")
-    try:
-        stream = client.run_checker(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
-    except Exception as e:
-        return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
-    try:
-        return _parse_sse_stream(stream)
-    except Exception as e:
-        return {"status": "STREAM_ERROR", "errorMessage": f"Error reading SSE stream: {e}", "test_results": []}
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            stream = client.run_checker(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
+            return _parse_sse_stream(stream)
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < max_retries:
+                wait = 60 * (2 ** (attempt - 1))  # 60, 120, 240 ...
+                print(f"  Rate limited ({e}). Waiting {wait}s then retrying ({attempt}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
 
 
 def run_tensara_benchmark(
     client: TensaraClient, slug: str, code: str, language: str, gpu_type: str = "H100"
 ) -> Dict[str, Any]:
-    """Run benchmark on Tensara and parse streaming SSE results."""
+    """Run benchmark on Tensara and parse streaming SSE results.
+    Retries automatically on HTTP 429 with exponential backoff."""
     print(f"Running benchmark on Tensara for problem '{slug}' (language: {language})...")
-    try:
-        stream = client.run_benchmark(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
-    except Exception as e:
-        return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
-    try:
-        return _parse_sse_stream(stream)
-    except Exception as e:
-        return {"status": "STREAM_ERROR", "errorMessage": f"Error reading SSE stream: {e}", "test_results": []}
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            stream = client.run_benchmark(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
+            return _parse_sse_stream(stream)
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < max_retries:
+                wait = 60 * (2 ** (attempt - 1))  # 60, 120, 240 ...
+                print(f"  Rate limited ({e}). Waiting {wait}s then retrying ({attempt}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
 
 
 def _ownbest_path(task_dir: Path, slug: str, language: str, gpu_type: str) -> Path:

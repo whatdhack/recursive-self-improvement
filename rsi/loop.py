@@ -31,11 +31,29 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TASK_DIR = ROOT / "tasks" / "gpu_kernel_task"
 PROVIDER = ROOT / "providers" / "do.json"
 
-sys.path.insert(0, str(TASK_DIR))
-from tensara_client import TensaraClient  # noqa: E402
+
+def _load_task(task_name: str) -> dict:
+    """Load task-specific config, prompts, and reference kernel from tasks/<task_name>/."""
+    task_dir = ROOT / "tasks" / task_name
+
+    config = json.loads((task_dir / "task_config.json").read_text())
+    reference_kernel = (task_dir / "reference_kernel.py").read_text()
+    meta_system_tmpl = (task_dir / "meta_system.md").read_text()
+    feedback_system_tmpl = (task_dir / "feedback_system.md").read_text()
+
+    return {
+        "dir": task_dir,
+        "config": config,
+        "reference_kernel": reference_kernel,
+        "meta_system": meta_system_tmpl.format(reference_kernel=reference_kernel),
+        "feedback_system": feedback_system_tmpl.format(
+            reference_kernel=reference_kernel,
+            **config,
+        ),
+        "leaderboard_target_gflops": config.get("leaderboard_target_gflops", 0.0),
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -83,34 +101,7 @@ def read_json(path: Path) -> dict:
         return json.load(f)
 
 
-# ── Step 1: Meta agent writes target_agent.py ────────────────────────────────
-
-# A minimal Triton matvec that compiles and runs correctly on H100.
-# Included verbatim in prompts so the LLM has a correct starting point.
-REFERENCE_KERNEL = '''\
-import triton
-import triton.language as tl
-
-@triton.jit
-def matvec_kernel(A_ptr, x_ptr, y_ptr, M, N, BLOCK_N: tl.constexpr):
-    row = tl.program_id(0)
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    for off in range(0, N, BLOCK_N):
-        cols = off + tl.arange(0, BLOCK_N)
-        mask = cols < N
-        a = tl.load(A_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        acc += a * x
-    tl.store(y_ptr + row, tl.sum(acc, axis=0))
-
-def solution(A, x, y, M, N):
-    BLOCK_N = 256
-    matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N)
-'''
-
 # ── Shared agentic loop (used by meta AND feedback agents) ────────────────────
-
-LEADERBOARD_TARGET_GFLOPS = 644.5  # H100 leaderboard #30 as of 2026-06-28
 
 
 def _run_agentic_loop(
@@ -252,53 +243,16 @@ def _run_agentic_loop(
 
 # ── Step 1: Meta agent (agentic loop, like siawdh) ────────────────────────────
 
-META_SYSTEM = """You are an expert AI engineer. Your task: write target_agent.py for a Triton GPU kernel task.
-
-WHAT YOU MUST DO:
-1. read_file the reference agent (path given in the user message) — study its structure
-2. read_file the task description (path given in the user message)
-3. write_file a custom target_agent.py at the output path given in the user message
-
-The target_agent.py will be run with env vars:
-  OPENAI_BASE_URL, OPENAI_API_KEY, MODEL_NAME  — LLM connection
-  TASK_MD                                       — path to task.md
-  OUTPUT_DIR                                    — directory to write sol.py, results.json
-
-It must have write_file, read_file, bash tools and an agent loop that:
-  1. Writes a Triton kernel to OUTPUT_DIR/sol.py (start from the REFERENCE KERNEL below)
-  2. Validates: python -m py_compile <sol_path>
-  3. Evaluates: python <evaluate_py> --gen-dir <OUTPUT_DIR> --problem matrix-vector
-  4. Reads results.json, fixes errors, iterates until ACCEPTED
-  5. After ACCEPTED: tries to improve GFLOPS (bigger BLOCK_N, num_warps=8)
-
-The SYSTEM_PROMPT inside target_agent.py MUST include:
-
-REFERENCE KERNEL (agent starts here — copy verbatim):
-{reference_kernel}
-
-TRITON RULES (include verbatim in SYSTEM_PROMPT):
-0. CRITICAL: do NOT `import torch` — Tensara forbids it. Use A.new_empty(M) instead of torch.empty().
-1. tl.zeros((BLOCK_N,), dtype=tl.float32) — NEVER tl.zeros(())
-2. NO tl.expand_dims
-3. NO Python `if` inside @triton.jit — use mask= on tl.load/tl.store
-4. BLOCK_N must be tl.constexpr and a power of 2 (256 or 512)
-5. One program per row: row = tl.program_id(0), grid = (M,)
-6. Explicit type cast on loads: .to(tl.float32)
-
-Write ONLY target_agent.py using write_file. Do not print the code.""".format(
-    reference_kernel=REFERENCE_KERNEL,
-)
-
-
-def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
+def run_meta_agent(meta_profile: Path, gdir: Path, task: dict) -> Path:
     provider_data = json.loads(PROVIDER.read_text())
     meta_data = json.loads(meta_profile.read_text())
     api_key = os.environ.get(provider_data["api_key_env"], "")
+    task_dir = task["dir"]
 
-    reference_path = TASK_DIR / "reference_target_agent.py"
-    task_md_path   = TASK_DIR / "task.md"
+    reference_path    = task_dir / "reference_target_agent.py"
+    task_md_path      = task_dir / "task.md"
     target_agent_path = gdir / "target_agent.py"
-    evaluate_py = TASK_DIR / "evaluate.py"
+    evaluate_py       = task_dir / "evaluate.py"
 
     user_message = (
         f"Reference agent to study: {reference_path}\n"
@@ -308,12 +262,12 @@ def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
         "Read the reference agent first, then write the adapted target_agent.py."
     )
 
-    log("  [meta] agentic loop (Kimi 2.6)...")
+    log("  [meta] agentic loop...")
     _run_agentic_loop(
         model=meta_data["model"],
         api_key=api_key,
         base_url=provider_data["base_url"],
-        system_prompt=META_SYSTEM,
+        system_prompt=task["meta_system"],
         user_message=user_message,
         max_turns=6,
     )
@@ -330,63 +284,23 @@ def run_meta_agent(meta_profile: Path, gdir: Path) -> Path:
 
 # ── Step 1b: Feedback agent (agentic loop, like siawdh) ──────────────────────
 
-FEEDBACK_SYSTEM = """You are an expert AI engineer improving a GPU kernel agent across generations.
-
-WHAT YOU MUST DO:
-1. read_file context.md (path given) — understand the full history of what was tried
-2. read_file results.json from the previous generation (path given) — see what failed
-3. read_file the previous target_agent.py (path given) — see the current implementation
-4. read_file sol.py from the previous generation (path given) — see the kernel produced
-5. read_file agent_execution.json (path given) — see the full tool call trace of what the agent tried
-6. (optional) read_file earlier improvement.md files to avoid repeating past mistakes
-7. write_file improvement.md — analysis: what went wrong, what to fix, what to try next
-8. write_file target_agent.py — improved agent that addresses the issues found
-
-── MODE A: CORRECTNESS (status is not ACCEPTED) ──────────────────────────────
-The kernel is failing. The SYSTEM_PROMPT inside target_agent.py must include:
-
-REFERENCE KERNEL (agent MUST start from this — embed it verbatim):
-{reference_kernel}
-
-TRITON RULES (always include all of these):
-0. CRITICAL: do NOT `import torch` — Tensara forbids it. Use A.new_empty(M) to allocate output.
-1. tl.zeros((BLOCK_N,), dtype=tl.float32) — NEVER tl.zeros(())
-2. NO tl.expand_dims
-3. NO Python `if` inside @triton.jit — use mask=
-4. BLOCK_N must be tl.constexpr and a power of 2
-5. One program per row: row = tl.program_id(0), grid = (M,)
-6. Explicit type cast: a = tl.load(...).to(tl.float32)
-
-── MODE B: PERFORMANCE (status is ACCEPTED) ──────────────────────────────────
-The kernel is correct. Push for higher GFLOPS in the SYSTEM_PROMPT:
-- Larger BLOCK_N (512, 1024)
-- tl.dot() for tensor cores
-- num_warps=8, num_stages=4
-- Multi-row tiles (BLOCK_ROWS × BLOCK_N)
-- Leaderboard target: {leaderboard_target:.1f} GFLOPS
-
-Write BOTH files using write_file — improvement.md first, then target_agent.py.""".format(
-    reference_kernel=REFERENCE_KERNEL,
-    leaderboard_target=LEADERBOARD_TARGET_GFLOPS,
-)
-
-
-def _perf_summary(results: dict) -> str:
-    """Format a compact performance summary from results.json for the feedback prompt."""
+def _perf_summary(results: dict, leaderboard_target_gflops: float) -> str:
+    """Format a compact performance summary from results.json."""
     status = results.get("status", "UNKNOWN")
     gflops = results.get("average_gflops")
     latency = results.get("average_latency_ms")
     error_msg = results.get("error_message", "")
 
     lines = [f"Status: {status}"]
-    if gflops:
-        pct = gflops / LEADERBOARD_TARGET_GFLOPS * 100
+    if gflops and leaderboard_target_gflops:
+        pct = gflops / leaderboard_target_gflops * 100
         lines.append(f"Performance: {gflops:.1f} GFLOPS  {latency:.3f} ms  "
-                     f"({pct:.1f}% of leaderboard target {LEADERBOARD_TARGET_GFLOPS:.1f} GFLOPS)")
+                     f"({pct:.1f}% of leaderboard target {leaderboard_target_gflops:.1f} GFLOPS)")
+    elif gflops:
+        lines.append(f"Performance: {gflops:.1f} GFLOPS  {latency:.3f} ms")
     if error_msg:
         lines.append(f"Error: {error_msg}")
 
-    # Per-shape breakdown (when ACCEPTED)
     details = results.get("details", [])
     if details:
         lines.append("Per-shape breakdown:")
@@ -407,22 +321,23 @@ def run_feedback_agent(
     prev_sol: Path,
     prev_results: dict,
     context_path: Path,
+    task: dict,
 ) -> Path:
     provider_data = json.loads(PROVIDER.read_text())
     meta_data = json.loads(meta_profile.read_text())
     api_key = os.environ.get(provider_data["api_key_env"], "")
+    task_dir = task["dir"]
 
     is_accepted = prev_results.get("status") in ("ACCEPTED", "CHECKED", "SUCCESS")
     mode = "B (performance)" if is_accepted else "A (correctness)"
-    perf = _perf_summary(prev_results)
+    perf = _perf_summary(prev_results, task["leaderboard_target_gflops"])
 
-    target_agent_path = gdir / "target_agent.py"
-    improvement_path  = gdir / "improvement.md"
-    prev_results_path   = prev_target_agent.parent / "results.json"        if prev_target_agent else None
+    target_agent_path   = gdir / "target_agent.py"
+    improvement_path    = gdir / "improvement.md"
+    prev_results_path   = prev_target_agent.parent / "results.json"         if prev_target_agent else None
     prev_execution_path = prev_target_agent.parent / "agent_execution.json" if prev_target_agent else None
-    evaluate_py = TASK_DIR / "evaluate.py"
+    evaluate_py         = task_dir / "evaluate.py"
 
-    # Build list of previous improvement.md files for context
     prev_improvements = []
     if prev_target_agent:
         for g in sorted(prev_target_agent.parent.parent.iterdir()):
@@ -434,25 +349,25 @@ def run_feedback_agent(
         f"Mode: {mode}\n"
         f"Latest eval result:\n{perf}\n\n"
         f"Files to read:\n"
-        f"  context.md:            {context_path}\n"
-        f"  prev target_agent.py:  {prev_target_agent or 'N/A'}\n"
-        f"  prev sol.py:           {prev_sol or 'N/A'}\n"
-        f"  prev results.json:     {prev_results_path or 'N/A'}\n"
+        f"  context.md:                {context_path}\n"
+        f"  prev target_agent.py:      {prev_target_agent or 'N/A'}\n"
+        f"  prev sol.py:               {prev_sol or 'N/A'}\n"
+        f"  prev results.json:         {prev_results_path or 'N/A'}\n"
         f"  prev agent_execution.json: {prev_execution_path or 'N/A'}\n"
-        + (f"  earlier improvements:  {', '.join(prev_improvements)}\n" if prev_improvements else "")
+        + (f"  earlier improvements:      {', '.join(prev_improvements)}\n" if prev_improvements else "")
         + f"\nFiles to write:\n"
-        f"  improvement.md:        {improvement_path}\n"
-        f"  target_agent.py:       {target_agent_path}\n"
-        f"  evaluate.py path:      {evaluate_py}\n\n"
+        f"  improvement.md:  {improvement_path}\n"
+        f"  target_agent.py: {target_agent_path}\n"
+        f"  evaluate.py:     {evaluate_py}\n\n"
         "Read all context files first, then write improvement.md and target_agent.py."
     )
 
-    log(f"  [feedback] agentic loop (Kimi 2.6, mode {mode})...")
+    log(f"  [feedback] agentic loop (mode {mode})...")
     _run_agentic_loop(
         model=meta_data["model"],
         api_key=api_key,
         base_url=provider_data["base_url"],
-        system_prompt=FEEDBACK_SYSTEM,
+        system_prompt=task["feedback_system"],
         user_message=user_message,
         max_turns=8,
     )
@@ -460,29 +375,32 @@ def run_feedback_agent(
     if not target_agent_path.exists():
         log("  [feedback] WARNING: target_agent.py not written — falling back to reference scaffold")
         import shutil
-        shutil.copy(TASK_DIR / "reference_target_agent.py", target_agent_path)
+        shutil.copy(task_dir / "reference_target_agent.py", target_agent_path)
 
     size = target_agent_path.stat().st_size
     log(f"  [feedback] wrote target_agent.py ({size} bytes)")
     return target_agent_path
 
 
-def update_context(context_path: Path, gen: int, status: str, results: dict, prev_gflops: float | None = None) -> None:
+def update_context(
+    context_path: Path, gen: int, status: str, results: dict,
+    leaderboard_target_gflops: float, prev_gflops: float | None = None,
+) -> None:
     gflops = results.get("average_gflops")
     latency = results.get("average_latency_ms")
     error_msg = results.get("error_message", "")
 
     line = f"Gen {gen}: {status}"
     if gflops:
-        pct = gflops / LEADERBOARD_TARGET_GFLOPS * 100
-        line += f" — {gflops:.1f} GFLOPS  {latency:.3f} ms  ({pct:.1f}% of target)"
+        if leaderboard_target_gflops:
+            pct = gflops / leaderboard_target_gflops * 100
+            line += f" — {gflops:.1f} GFLOPS  {latency:.3f} ms  ({pct:.1f}% of target)"
+        else:
+            line += f" — {gflops:.1f} GFLOPS  {latency:.3f} ms"
         if prev_gflops:
-            delta = gflops - prev_gflops
-            line += f"  Δ{delta:+.1f} GFLOPS"
+            line += f"  Δ{gflops - prev_gflops:+.1f} GFLOPS"
     if error_msg:
-        # Keep it to one line — first line of the error is most useful
-        first_line = error_msg.splitlines()[0][:120]
-        line += f" — {first_line}"
+        line += f" — {error_msg.splitlines()[0][:120]}"
 
     with open(context_path, "a") as f:
         f.write(line + "\n")
@@ -490,7 +408,7 @@ def update_context(context_path: Path, gen: int, status: str, results: dict, pre
 
 # ── Step 2: Target agent runs and writes sol.py ───────────────────────────────
 
-def run_target_agent(target_profile: Path, target_agent_path: Path, gdir: Path) -> Path:
+def run_target_agent(target_profile: Path, target_agent_path: Path, gdir: Path, task: dict) -> Path:
     import json as _json
     target_profile_data = _json.loads(target_profile.read_text())
     provider_data = _json.loads(PROVIDER.read_text())
@@ -500,7 +418,7 @@ def run_target_agent(target_profile: Path, target_agent_path: Path, gdir: Path) 
     env["OPENAI_BASE_URL"] = provider_data["base_url"]
     env["OPENAI_API_KEY"] = api_key
     env["MODEL_NAME"] = target_profile_data["model"]
-    env["TASK_MD"] = str(TASK_DIR / "task.md")
+    env["TASK_MD"] = str(task["dir"] / "task.md")
     env["OUTPUT_DIR"] = str(gdir)
 
     log(f"  [target] running target_agent.py (model: {target_profile_data['model']})...")
@@ -564,8 +482,8 @@ def _clean_sol(sol_path: Path) -> Path:
 
 # ── Step 3: Evaluate via Tensara ──────────────────────────────────────────────
 
-def run_evaluation(gdir: Path, problem: str, gpu_type: str, submit: bool = False) -> dict:
-    evaluate_script = TASK_DIR / "evaluate.py"
+def run_evaluation(gdir: Path, problem: str, gpu_type: str, task: dict, submit: bool = False) -> dict:
+    evaluate_script = task["dir"] / "evaluate.py"
     cmd = [sys.executable, str(evaluate_script), "--gen-dir", str(gdir),
            "--problem", problem, "--gpu-type", gpu_type]
     if submit:
@@ -645,6 +563,8 @@ def run_curate_and_train(
 def main() -> None:
     parser = argparse.ArgumentParser(description="RSI loop — Recursive Self-Improvement")
     parser.add_argument("command", choices=["run"])
+    parser.add_argument("--task", default="gpu_kernel_task",
+                        help="Task directory name under tasks/ (default: gpu_kernel_task)")
     parser.add_argument("--problem", default="matrix-vector")
     parser.add_argument("--meta-agent-profile", default="profiles/kimi26-do.json")
     parser.add_argument("--target-agent-profile", default="profiles/nemotron-do.json")
@@ -662,6 +582,8 @@ def main() -> None:
     parser.add_argument("--submit", action="store_true", default=False,
                         help="Submit to Tensara leaderboard when ACCEPTED and beats personal best")
     args = parser.parse_args()
+
+    task = _load_task(args.task)
 
     meta_profile = ROOT / args.meta_agent_profile
     target_profile = ROOT / args.target_agent_profile
@@ -682,7 +604,7 @@ def main() -> None:
     prev_sol: Path | None = None
     prev_results: dict = {}
 
-    print(f"\nRSI Loop — {args.problem}  (GPU: {args.gpu_type})")
+    print(f"\nRSI Loop — task={args.task}  problem={args.problem}  GPU={args.gpu_type}")
     print("─" * 60)
 
     for gen in range(args.max_gen):
@@ -692,11 +614,11 @@ def main() -> None:
         # Step 1: Meta agent bootstraps gen 0; feedback agent rewrites for gen 1+
         try:
             if gen == 0:
-                target_agent_path = run_meta_agent(meta_profile, gdir)
+                target_agent_path = run_meta_agent(meta_profile, gdir, task)
             else:
                 target_agent_path = run_feedback_agent(
                     meta_profile, gdir,
-                    prev_target_agent, prev_sol, prev_results, context_path,
+                    prev_target_agent, prev_sol, prev_results, context_path, task,
                 )
         except Exception as e:
             log(f"[Gen {gen}] agent failed: {e}")
@@ -704,14 +626,14 @@ def main() -> None:
 
         # Step 2: Target agent
         try:
-            sol_path = run_target_agent(target_profile, target_agent_path, gdir)
+            sol_path = run_target_agent(target_profile, target_agent_path, gdir, task)
         except Exception as e:
             log(f"[Gen {gen}] target agent failed: {e}")
             continue
 
         # Step 3: Evaluate
         log(f"[Gen {gen}] evaluating via Tensara ({args.gpu_type})...")
-        results = run_evaluation(gdir, args.problem, args.gpu_type, submit=args.submit)
+        results = run_evaluation(gdir, args.problem, args.gpu_type, task, submit=args.submit)
         status = results.get("status", "UNKNOWN")
         gflops = results.get("average_gflops")
         latency = results.get("average_latency_ms")
@@ -722,7 +644,10 @@ def main() -> None:
 
         # Update context and carry state forward for the feedback agent
         prev_gflops = prev_results.get("average_gflops")
-        update_context(context_path, gen, status, results, prev_gflops)
+        update_context(
+            context_path, gen, status, results,
+            task["leaderboard_target_gflops"], prev_gflops,
+        )
         prev_target_agent = target_agent_path
         prev_sol = sol_path
         prev_results = results
