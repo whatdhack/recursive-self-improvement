@@ -90,7 +90,6 @@ def read_json(path: Path) -> dict:
 REFERENCE_KERNEL = '''\
 import triton
 import triton.language as tl
-import torch
 
 @triton.jit
 def matvec_kernel(A_ptr, x_ptr, y_ptr, M, N, BLOCK_N: tl.constexpr):
@@ -104,12 +103,9 @@ def matvec_kernel(A_ptr, x_ptr, y_ptr, M, N, BLOCK_N: tl.constexpr):
         acc += a * x
     tl.store(y_ptr + row, tl.sum(acc, axis=0))
 
-def solution(A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    M, N = A.shape
-    y = torch.empty(M, device=A.device, dtype=torch.float32)
+def solution(A, x, y, M, N):
     BLOCK_N = 256
     matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N)
-    return y
 '''
 
 # ── Shared agentic loop (used by meta AND feedback agents) ────────────────────
@@ -281,6 +277,7 @@ REFERENCE KERNEL (agent starts here — copy verbatim):
 {reference_kernel}
 
 TRITON RULES (include verbatim in SYSTEM_PROMPT):
+0. CRITICAL: do NOT `import torch` — Tensara forbids it. Use A.new_empty(M) instead of torch.empty().
 1. tl.zeros((BLOCK_N,), dtype=tl.float32) — NEVER tl.zeros(())
 2. NO tl.expand_dims
 3. NO Python `if` inside @triton.jit — use mask= on tl.load/tl.store
@@ -352,6 +349,7 @@ REFERENCE KERNEL (agent MUST start from this — embed it verbatim):
 {reference_kernel}
 
 TRITON RULES (always include all of these):
+0. CRITICAL: do NOT `import torch` — Tensara forbids it. Use A.new_empty(M) to allocate output.
 1. tl.zeros((BLOCK_N,), dtype=tl.float32) — NEVER tl.zeros(())
 2. NO tl.expand_dims
 3. NO Python `if` inside @triton.jit — use mask=

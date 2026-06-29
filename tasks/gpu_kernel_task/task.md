@@ -22,11 +22,17 @@ where `A` is an `M × N` matrix and `x` is a vector of length `N`, producing out
 
 ## Interface
 
+Tensara calls `solution(A, x, y, M, N)` — y is pre-allocated by Tensara, do NOT allocate it.
+Do NOT `import torch` — Tensara forbids it.
+
 ```python
-def solution(A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    # A: (M, N), x: (N,)
-    # returns y: (M,)
-    ...
+def solution(A, x, y, M, N):
+    # A: (M, N) float32 tensor
+    # x: (N,) float32 tensor
+    # y: (M,) float32 tensor — pre-allocated output, write results into it
+    # M, N: integer dimensions
+    BLOCK_N = 256
+    matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N)
 ```
 
 ## Test Case Sizes
