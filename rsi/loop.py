@@ -169,9 +169,14 @@ def _run_agentic_loop(
             f.write(content)
         return f"Written {len(content)} chars to {path}."
 
-    def _read(path: str) -> str:
+    def _read(path: str, offset: int = 0, limit: int | None = None) -> str:
         try:
-            return open(path, encoding="utf-8").read()
+            lines = open(path, encoding="utf-8").readlines()
+            if offset:
+                lines = lines[offset:]
+            if limit is not None:
+                lines = lines[:limit]
+            return "".join(lines)
         except FileNotFoundError:
             return f"Error: {path} not found."
         except Exception as e:
