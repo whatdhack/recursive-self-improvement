@@ -564,14 +564,13 @@ def _clean_sol(sol_path: Path) -> Path:
 
 # ── Step 3: Evaluate via Tensara ──────────────────────────────────────────────
 
-def run_evaluation(gdir: Path, problem: str, gpu_type: str) -> dict:
+def run_evaluation(gdir: Path, problem: str, gpu_type: str, submit: bool = False) -> dict:
     evaluate_script = TASK_DIR / "evaluate.py"
-    result = subprocess.run(
-        [sys.executable, str(evaluate_script), "--gen-dir", str(gdir),
-         "--problem", problem, "--gpu-type", gpu_type],
-        capture_output=False,
-        text=True,
-    )
+    cmd = [sys.executable, str(evaluate_script), "--gen-dir", str(gdir),
+           "--problem", problem, "--gpu-type", gpu_type]
+    if submit:
+        cmd.append("--submit")
+    subprocess.run(cmd, capture_output=False, text=True)
     results_path = gdir / "results.json"
     if results_path.exists():
         return read_json(results_path)
@@ -660,6 +659,8 @@ def main() -> None:
     parser.add_argument("--llama-bin-dir", default="./llama.cpp/build/bin",
                         help="Directory containing llama-finetune and llama-export-lora")
     parser.add_argument("--run-dir", default="./runs")
+    parser.add_argument("--submit", action="store_true", default=False,
+                        help="Submit to Tensara leaderboard when ACCEPTED and beats personal best")
     args = parser.parse_args()
 
     meta_profile = ROOT / args.meta_agent_profile
@@ -710,7 +711,7 @@ def main() -> None:
 
         # Step 3: Evaluate
         log(f"[Gen {gen}] evaluating via Tensara ({args.gpu_type})...")
-        results = run_evaluation(gdir, args.problem, args.gpu_type)
+        results = run_evaluation(gdir, args.problem, args.gpu_type, submit=args.submit)
         status = results.get("status", "UNKNOWN")
         gflops = results.get("average_gflops")
         latency = results.get("average_latency_ms")
