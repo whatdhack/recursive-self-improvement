@@ -39,9 +39,28 @@ def _load_task(task_name: str) -> dict:
     task_dir = ROOT / "tasks" / task_name
 
     config = json.loads((task_dir / "task_config.json").read_text())
-    reference_kernel = (task_dir / "reference_kernel.py").read_text()
     meta_system_tmpl = (task_dir / "meta_system.md").read_text()
     feedback_system_tmpl = (task_dir / "feedback_system.md").read_text()
+
+    # Prefer ownbest as the starting kernel so each run improves on the best known solution.
+    # Fall back to the static reference kernel if no ownbest exists yet.
+    ownbest_glob = list((task_dir / "ownbest" / "tensara").glob("*.py")) if (task_dir / "ownbest" / "tensara").exists() else []
+    if ownbest_glob:
+        # Pick the file with the highest gflops header comment
+        def _gflops(p):
+            for line in p.read_text().splitlines():
+                if line.startswith("# gflops:"):
+                    try:
+                        return float(line.split(":")[1].strip())
+                    except ValueError:
+                        pass
+            return 0.0
+        best_file = max(ownbest_glob, key=_gflops)
+        reference_kernel = best_file.read_text()
+        log(f"  [task] seeding from ownbest: {best_file.name}  ({_gflops(best_file):.1f} GFLOPS)")
+    else:
+        reference_kernel = (task_dir / "reference_kernel.py").read_text()
+        log("  [task] no ownbest found — seeding from reference_kernel.py")
 
     return {
         "dir": task_dir,
