@@ -512,7 +512,12 @@ def run_evaluation(gdir: Path, problem: str, gpu_type: str, task: dict, submit: 
            "--problem", problem, "--gpu-type", gpu_type]
     if submit:
         cmd.append("--submit")
-    subprocess.run(cmd, capture_output=False, text=True)
+    # capture_output=True then print so output flows through _Tee to the log file.
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
     results_path = gdir / "results.json"
     if results_path.exists():
         return read_json(results_path)

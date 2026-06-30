@@ -678,11 +678,13 @@ def main():
             print(f"\nSubmitting to Tensara leaderboard (new personal best: {avg_latency:.4f} ms, prev: {prev_str})...")
             try:
                 submit_stream = client.submit_solution(slug, code, language=language, gpu_type=args.gpu_type)
+                # Record immediately after submit_solution() so a stream-parse failure
+                # doesn't leave the cache empty and cause re-submission next run.
+                client.record_submission(slug, args.gpu_type, language, avg_latency)
                 submit_result = _parse_sse_stream(submit_stream)
                 submit_status = submit_result.get("status", "UNKNOWN")
                 print(f"Submission status: {submit_status}")
                 eval_results["submission_status"] = submit_status
-                client.record_submission(slug, args.gpu_type, language, avg_latency)
                 with open(output_path, "w", encoding="utf-8") as f:
                     json.dump(eval_results, f, indent=2)
             except Exception as e:
