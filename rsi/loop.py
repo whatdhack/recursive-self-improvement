@@ -526,6 +526,15 @@ def run_evaluation(gdir: Path, problem: str, gpu_type: str, task: dict, submit: 
 
 # ── Step 4+5: Curate failures + train ─────────────────────────────────────────
 
+def _gguf_for_gen(gen: int, run_dir: Path, base_model: str) -> Path:
+    """Return the GGUF to use for curation at gen N: previous gen's trained model or base."""
+    if gen > 0:
+        candidate = run_dir / f"gen-{gen - 1}" / f"gemma4-gen{gen - 1}.gguf"
+        if candidate.exists():
+            return candidate
+    return Path(base_model)
+
+
 def run_curate_and_train(
     gdir: Path,
     run_dir: Path,
@@ -536,7 +545,7 @@ def run_curate_and_train(
     tracker,
     args,
 ) -> tuple:
-    from rsi.curate import append_to_jsonl, curate_via_api
+    from rsi.curate import append_to_jsonl, curate_via_api, curate_via_local_server
     from rsi.train import LoraConfig, merge_lora, run_lora_training, save_hp_log
 
     train_jsonl = run_dir / "train.jsonl"
@@ -547,7 +556,37 @@ def run_curate_and_train(
     if status not in ("ACCEPTED", "CHECKED", "SUCCESS") and sol_path.exists():
         log("  [curate] generating training pair from failure...")
         failed_code = sol_path.read_text()
-        pair = curate_via_api(failed_code, results, curator_profile, PROVIDER)
+
+        if args.local_curator and args.base_model:
+            gguf = _gguf_for_gen(gen, run_dir, args.base_model)
+            llama_server_bin = Path(args.llama_bin_dir) / "llama-server"
+            if llama_server_bin.exists() and gguf.exists():
+                from rsi.llama_server import LlamaServer
+                log(f"  [curate] starting llama-server (model={gguf.name})...")
+                server = LlamaServer(
+                    llama_server_bin, gguf,
+                    port=args.llama_server_port,
+                    threads=args.threads,
+                )
+                pair = None
+                try:
+                    server.start()
+                    log("  [curate] server ready — calling local model...")
+                    pair = curate_via_local_server(failed_code, results, server.base_url())
+                except Exception as e:
+                    log(f"  [curate] local server failed ({e}) — falling back to cloud")
+                finally:
+                    server.stop()
+                    log("  [curate] server stopped")
+                if pair is None:
+                    pair = curate_via_api(failed_code, results, curator_profile, PROVIDER)
+            else:
+                missing = llama_server_bin if not llama_server_bin.exists() else gguf
+                log(f"  [curate] {missing} not found — using cloud curator")
+                pair = curate_via_api(failed_code, results, curator_profile, PROVIDER)
+        else:
+            pair = curate_via_api(failed_code, results, curator_profile, PROVIDER)
+
         if pair:
             append_to_jsonl(pair, train_jsonl)
         else:
@@ -606,7 +645,12 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--llama-bin-dir", default="./llama.cpp/build/bin",
-                        help="Directory containing llama-finetune and llama-export-lora")
+                        help="Directory containing llama-finetune, llama-export-lora, llama-server")
+    parser.add_argument("--local-curator", action="store_true", default=False,
+                        help="Use local llama-server (Gemma4-1B GGUF) for curation instead of cloud API. "
+                             "Requires --base-model and llama-server in --llama-bin-dir.")
+    parser.add_argument("--llama-server-port", type=int, default=8080,
+                        help="Port for the local llama-server (default: 8080)")
     parser.add_argument("--run-dir", default="./runs")
     parser.add_argument("--submit", action="store_true", default=False,
                         help="Submit to Tensara leaderboard when ACCEPTED and beats personal best")

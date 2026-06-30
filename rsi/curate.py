@@ -77,6 +77,38 @@ def curate_via_api(
     return _parse_pair(raw)
 
 
+def curate_via_local_server(
+    failed_code: str,
+    results: dict,
+    base_url: str,
+    max_tokens: int = 2048,
+) -> dict | None:
+    """Use a running llama-server (OpenAI-compat) to generate a training pair."""
+    from openai import OpenAI
+
+    error_text = _extract_error(results)
+    user_prompt = (
+        f"Failed Triton kernel:\n```python\n{failed_code}\n```\n\n"
+        f"Error output:\n{error_text}\n\n"
+        "Produce the training pair JSON now."
+    )
+    try:
+        client = OpenAI(api_key="no-key", base_url=base_url)
+        response = client.chat.completions.create(
+            model="local",
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        raw = response.choices[0].message.content or ""
+        return _parse_pair(raw)
+    except Exception as e:
+        print(f"  [curate] local server error: {e}")
+        return None
+
+
 def curate_synthetic(task_md: str, correct_code: str) -> dict:
     """
     Produce a training pair from a CORRECT solution (no LLM needed).
