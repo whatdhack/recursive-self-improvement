@@ -19,9 +19,10 @@ import ast
 import json
 import argparse
 import time
+import re
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Add script directory to sys.path so we can import tensara_client
 script_dir = Path(__file__).resolve().parent
@@ -29,6 +30,36 @@ if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 from tensara_client import TensaraClient
+
+
+def _check_global_rate_limit(gen_dir: Path) -> Optional[Dict[str, Any]]:
+    """
+    Look for a shared rate-limit state file in the run directory.
+    If a cooldown is active, return a results dict so the caller can skip
+    immediately without burning any Tensara API quota.
+    """
+    try:
+        run_dir = gen_dir.parent  # gen_dir is e.g. .../run-run015/gen-4/
+        state_path = run_dir / "rate_limit_state.json"
+        if not state_path.exists():
+            return None
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        retry_until = state.get("retry_until", 0.0)
+        if retry_until and time.time() < retry_until:
+            remaining = retry_until - time.time()
+            return {
+                "accuracy": 0.0,
+                "correct": 0,
+                "total": 0,
+                "status": "RATE_LIMIT_SKIPPED",
+                "error_message": f"Global rate limit active. Retry after ~{remaining/60:.0f} minutes.",
+                "retry_after_seconds": remaining,
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+    except Exception:
+        pass
+    return None
 
 
 def find_solution_file(gen_dir: Path) -> Optional[Path]:
@@ -265,11 +296,32 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in msg or "rate limit" in msg.lower()
 
 
+def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Parse the 'Please try again in ...' string from a 429 exception."""
+    msg = str(exc)
+    # Handle patterns like:
+    #   "Please try again in 1h 9m"
+    #   "Please try again in 30s"
+    #   "Please try again in 2h"
+    #   "Please try again in 1h 20m"
+    match = re.search(
+        r"try again in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s?)?",
+        msg,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def run_tensara_checker(
     client: TensaraClient, slug: str, code: str, language: str, gpu_type: str = "H100"
 ) -> Dict[str, Any]:
     """Check correctness against the reference implementation before benchmarking.
-    Retries automatically on HTTP 429 with exponential backoff."""
+    Retries automatically on HTTP 429 with exponential backoff, respecting retry-after."""
     print(f"Checking correctness on Tensara for problem '{slug}' (language: {language})...")
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -277,10 +329,28 @@ def run_tensara_checker(
             stream = client.run_checker(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
             return _parse_sse_stream(stream)
         except Exception as e:
-            if _is_rate_limit_error(e) and attempt < max_retries:
-                wait = 60 * (2 ** (attempt - 1))  # 60, 120, 240 ...
-                print(f"  Rate limited ({e}). Waiting {wait}s then retrying ({attempt}/{max_retries})...")
-                time.sleep(wait)
+            if _is_rate_limit_error(e):
+                retry_after = _extract_retry_after_seconds(e)
+                if retry_after is not None:
+                    # If the server wants us to wait more than 600 seconds, save quota by aborting immediately
+                    if retry_after > 600:
+                        print(f"  Rate limited ({e}). Retry-after is {retry_after}s — aborting to save quota.")
+                        return {
+                            "status": "CLIENT_ERROR",
+                            "errorMessage": str(e),
+                            "retry_after_seconds": retry_after,
+                            "test_results": [],
+                        }
+                    wait = retry_after
+                    print(f"  Rate limited ({e}). Waiting {wait}s as instructed by server...")
+                    time.sleep(wait)
+                else:
+                    if attempt < max_retries:
+                        wait = 60 * (2 ** (attempt - 1))  # 60, 120, 240 ...
+                        print(f"  Rate limited ({e}). Waiting {wait}s then retrying ({attempt}/{max_retries})...")
+                        time.sleep(wait)
+                    else:
+                        return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
             else:
                 return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
 
@@ -289,7 +359,7 @@ def run_tensara_benchmark(
     client: TensaraClient, slug: str, code: str, language: str, gpu_type: str = "H100"
 ) -> Dict[str, Any]:
     """Run benchmark on Tensara and parse streaming SSE results.
-    Retries automatically on HTTP 429 with exponential backoff."""
+    Retries automatically on HTTP 429 with exponential backoff, respecting retry-after."""
     print(f"Running benchmark on Tensara for problem '{slug}' (language: {language})...")
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -297,10 +367,27 @@ def run_tensara_benchmark(
             stream = client.run_benchmark(slug, code, dtype="float32", language=language, gpu_type=gpu_type)
             return _parse_sse_stream(stream)
         except Exception as e:
-            if _is_rate_limit_error(e) and attempt < max_retries:
-                wait = 60 * (2 ** (attempt - 1))  # 60, 120, 240 ...
-                print(f"  Rate limited ({e}). Waiting {wait}s then retrying ({attempt}/{max_retries})...")
-                time.sleep(wait)
+            if _is_rate_limit_error(e):
+                retry_after = _extract_retry_after_seconds(e)
+                if retry_after is not None:
+                    if retry_after > 600:
+                        print(f"  Rate limited ({e}). Retry-after is {retry_after}s — aborting to save quota.")
+                        return {
+                            "status": "CLIENT_ERROR",
+                            "errorMessage": str(e),
+                            "retry_after_seconds": retry_after,
+                            "test_results": [],
+                        }
+                    wait = retry_after
+                    print(f"  Rate limited ({e}). Waiting {wait}s as instructed by server...")
+                    time.sleep(wait)
+                else:
+                    if attempt < max_retries:
+                        wait = 60 * (2 ** (attempt - 1))  # 60, 120, 240 ...
+                        print(f"  Rate limited ({e}). Waiting {wait}s then retrying ({attempt}/{max_retries})...")
+                        time.sleep(wait)
+                    else:
+                        return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
             else:
                 return {"status": "CLIENT_ERROR", "errorMessage": str(e), "test_results": []}
 
@@ -426,6 +513,20 @@ def main():
         sol_file = find_solution_file(gen_dir)
         output_path = args.output or gen_dir / "results.json"
 
+    # ── Global rate-limit gate (run before any Tensara API call) ────────
+    global_rate_limit = _check_global_rate_limit(gen_dir)
+    if global_rate_limit is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(global_rate_limit, f, indent=2)
+        print("\n" + "=" * 80)
+        print("Tensara Evaluation Results")
+        print("=" * 80)
+        print(f"Status:  {global_rate_limit['status']}")
+        print(f"Error:   {global_rate_limit['error_message']}")
+        print("=" * 80)
+        sys.exit(0)
+
     # Handle missing solution file
     if not sol_file or not sol_file.exists():
         error_text = f"No solution file (sol.py or sol.cu) found in {gen_dir}."
@@ -436,7 +537,7 @@ def main():
             "total": 0,
             "status": "NO_SOLUTION_FILE",
             "error_message": error_text,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -464,7 +565,7 @@ def main():
                 "correct": 0,
                 "total": 0,
                 "status": "STATIC_CHECK_FAILED",
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "error_message": f"Static analysis failed:\n{issue_text}",
                 "details": [],
             }
@@ -526,13 +627,16 @@ def main():
             "correct": checker_passed_count,
             "total": checker_total_count,
             "status": checker_status,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "details": checker_results_list,
         }
         if checker_data.get("errorMessage"):
             eval_results["error_message"] = checker_data["errorMessage"]
         if checker_data.get("errorDetails"):
             eval_results["error_details"] = checker_data["errorDetails"]
+        # Forward retry-after hint if present
+        if "retry_after_seconds" in checker_data:
+            eval_results["retry_after_seconds"] = checker_data["retry_after_seconds"]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(eval_results, f, indent=2)
@@ -581,13 +685,15 @@ def main():
         "correct": passed_count,
         "total": total_count,
         "status": status,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
     if error_msg:
         eval_results["error_message"] = error_msg
     if error_det:
         eval_results["error_details"] = error_det
+    if "retry_after_seconds" in benchmark_data:
+        eval_results["retry_after_seconds"] = benchmark_data["retry_after_seconds"]
 
     # Calculate average latency and GFLOPS
     latencies = [

@@ -1,8 +1,8 @@
 # problem:    matrix-vector
 # gpu:        H100
 # language:   triton
-# gflops:     679.97
-# latency_ms: 0.0825
+# gflops:     707.57
+# latency_ms: 0.0793
 # date:       2026-06-29
 
 import triton
@@ -15,11 +15,11 @@ def matvec_kernel(A_ptr, x_ptr, y_ptr, M, N, BLOCK_N: tl.constexpr):
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)
         mask = cols < N
-        a = tl.load(A_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        a = tl.load(tl.multiple_of(A_ptr + row * N + cols, 16), mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        x = tl.load(tl.multiple_of(x_ptr + cols, 16), mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
         acc += a * x
     tl.store(y_ptr + row, tl.sum(acc, axis=0))
 
 def solution(A, x, y, M, N):
-    BLOCK_N = 256
-    matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N)
+    BLOCK_N = 2048
+    matvec_kernel[(M,)](A, x, y, M, N, BLOCK_N=BLOCK_N, num_warps=16)
